@@ -1,0 +1,51 @@
+Git Quick Push log saved at: 2026-06-14 11:02:56
+Script: C:\Python_W_new\PTools\GitQuickPush\git_quickpush_gui.ps1
+
+Git Quick Push build: 2026-06-07.3
+Script: C:\Python_W_new\PTools\GitQuickPush\git_quickpush_gui.ps1
+Gekozen map ligt binnen git-repository:
+  C:/QBtor
+  GitHub URL automatisch opgebouwd:
+    https://github.com/EddySoc/QBtor.git
+  VS Code Save All triggeren...
+  Huidige git status:
+  Bestanden toevoegen...
+  Git add met --verbose mislukt; herprobeer zonder --verbose...
+  Git add retry zonder --verbose gelukt.
+  Toegevoegde bestanden:
+    [M] Step_00_Edit_Config_GUI.ps1
+    [M] Step_05_Download_Subs.ps1
+    [M] Step_06_Speech_To_Text.ps1
+    [M] Step_10_Sync_Subs.ps1
+    [M] Step_11_Translate_Subs.ps1
+    [M] config.example.ini
+  Origin remote wijkt af van de automatisch opgebouwde GitHub URL.
+    Huidig: https://github.com/EddySoc/MKV-Script-powershell.git
+    Nieuw:  https://github.com/EddySoc/QBtor.git
+  Origin remote wordt aangepast...
+  Te committen bestanden:
+  Committen...
+  [main 8cbe876] bug srt fix
+   6 files changed, 86 insertions(+), 29 deletions(-)
+  Preflight: remote check via git ls-remote...
+  GitHub repository bestaat nog niet.
+  Browser geopend: https://github.com/new?name=QBtor
+  Open aanmaakpagina: https://github.com/new?name=QBtor
+  Open login via: https://github.com/login
+  github.com
+    Ô£ô Logged in to github.com account EddySoc (keyring)
+    - Active account: true
+    - Git operations protocol: https
+    - Token: gho_************************************
+    - Token scopes: 'delete_repo', 'gist', 'read:org', 'repo', 'workflow'
+  Probeer repository automatisch aan te maken via gh: EddySoc/QBtor
+  https://github.com/EddySoc/QBtor
+  Repository automatisch aangemaakt via gh. Controle van remote bereikbaar...
+  Remote check OK: nieuwe GitHub repository is bereikbaar.
+  We gaan door met pushen.
+  Pushen naar GitHub...
+  8cbe876c7971498f236f99d049d8fd2c066e027b	refs/heads/main
+  Preflight OK: remote repository is bereikbaar.
+  Push gaf een foutmelding, maar remote staat al gelijk aan lokaal. Geen actie nodig.
+  Workflow eindigde met fout; remote-statuscontrole overgeslagen.
+
