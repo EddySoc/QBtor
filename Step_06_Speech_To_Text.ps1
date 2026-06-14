@@ -197,18 +197,10 @@ function Invoke-STT {
         $videoName = $video.BaseName
         $videoDir  = $video.DirectoryName
 
-        # Title prefix (zelfde logica als stap 10/11)
-        $titlePrefix = if ($videoName -match '^(.+?\.\d{4})\.') {
-            $matches[1]
-        } elseif ($videoName -match '^(.+?\.S\d{2}E\d{2})[\.\s]') {
-            $matches[1]
-        } else {
-            $videoName
-        }
-
-        # Controleer of er al een sub bestaat (elke taal)
+        # Controleer of er al een sub bestaat voor exact dit videobestand (elke taal).
+        # Gebruik geen serie-brede prefix, anders kan E02 ten onrechte E01 matchen.
         $existingSubs = @(Get-ChildItem -LiteralPath $videoDir -File -Filter "*.srt" -ErrorAction SilentlyContinue |
-                          Where-Object { $_.Name -like "$titlePrefix*.srt" })
+                          Where-Object { $_.BaseName -match "^$([regex]::Escape($videoName))(\.|$)" })
 
         if ($existingSubs.Count -gt 0) {
             $taggedName  = "$videoName.$subLangTag.srt"

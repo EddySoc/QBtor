@@ -244,7 +244,8 @@ function Get-SearchQueryFromVideoName {
 function Test-SubtitleTitleMatch {
     param(
         [string]$VideoName,
-        [string]$FetchedRelease
+        [string]$FetchedRelease,
+        [bool]$StrictMode = $false
     )
 
     if (-not $FetchedRelease) { return $true }
@@ -258,8 +259,31 @@ function Test-SubtitleTitleMatch {
     if ($videoTokens.Count -eq 0 -or $releaseTokens.Count -eq 0) { return $true }
 
     $overlap = @($videoTokens | Where-Object { $releaseTokens -contains $_ } | Select-Object -Unique).Count
-    $required = [Math]::Max(1, [Math]::Ceiling($videoTokens.Count * 0.4))
+    $requiredRatio = if ($StrictMode) { 0.7 } else { 0.4 }
+    $required = [Math]::Max(1, [Math]::Ceiling($videoTokens.Count * $requiredRatio))
+
+    if ($StrictMode) {
+        # In strikte modus: als video-naam een jaartal bevat, moet dat ook in release zitten.
+        $videoYearMatch = [regex]::Match($VideoName, '(19\d{2}|20\d{2})')
+        if ($videoYearMatch.Success -and ($FetchedRelease -notmatch [regex]::Escape($videoYearMatch.Value))) {
+            return $false
+        }
+    }
+
     return ($overlap -ge $required)
+}
+
+function Test-StrictSubtitleDownloadEnabled {
+    $raw = if ($null -ne $Global:StrictSubtitleDownload) {
+        $Global:StrictSubtitleDownload
+    } elseif ($null -ne $Global:StrictDownloadMatch) {
+        # Backward-compatible alias if users already created this key manually.
+        $Global:StrictDownloadMatch
+    } else {
+        $false
+    }
+
+    return @('1', 'true', 'yes', 'on') -contains "$raw".Trim().ToLower()
 }
 
 function Get-OpenSubtitlesAuthSettings {
@@ -334,7 +358,8 @@ function Get-OpenSubtitlesComLanguageCode {
 function Download-SubtitleViaOpenSubtitlesCom {
     param(
         [string]$VideoPath,
-        [hashtable]$AuthSettings
+        [hashtable]$AuthSettings,
+        [bool]$StrictMode = $false
     )
 
     $username = "$($AuthSettings.OsComUser)".Trim()
@@ -401,7 +426,7 @@ function Download-SubtitleViaOpenSubtitlesCom {
             $attributes.feature_details.title
         ) | Where-Object { $_ } | Select-Object -First 1
 
-        if ($releaseName -and -not (Test-SubtitleTitleMatch -VideoName $videoName -FetchedRelease $releaseName)) {
+        if ($releaseName -and -not (Test-SubtitleTitleMatch -VideoName $videoName -FetchedRelease $releaseName -StrictMode $StrictMode)) {
             continue
         }
 
@@ -467,6 +492,16 @@ function Download-SubtitleViaOpenSubtitlesCom {
 # --- FUNCTIE: Subs downloaden via FileBot
 function Download-Subtitles {
     DrawBanner -Text "STEP 05 DOWNLOADING SUBS"
+
+    $strictSubtitleDownload = Test-StrictSubtitleDownloadEnabled
+    $strictSkipSyncList = Join-Path $Global:LogDir "strict_stt_skip_sync.txt"
+    Set-Content -Path $strictSkipSyncList -Value "" -Encoding UTF8
+
+    if ($strictSubtitleDownload) {
+        Show-Format "CONFIG" "StrictSubtitleDownload=true" "Alleen strikt gematchte subtitles worden aanvaard" -NameColor "Cyan"
+    } else {
+        Show-Format "CONFIG" "StrictSubtitleDownload=false" "Niet-strikte providers/fallback blijven toegestaan" -NameColor "DarkGray"
+    }
     
     # Get OpenSubtitles credentials (.org for FileBot, .com for API fallback)
     $authPath = Join-Path $Global:ScriptDir $AuthFile
@@ -667,11 +702,14 @@ function Download-Subtitles {
                 '-get-subtitles', $videoPath,
                 '--lang', $Global:LangKeep,
                 '--db', $db,
-                '-non-strict',
                 '--output', 'srt',
                 '--encoding', 'UTF-8',
                 '--log-file', $filebotLog
             )
+
+            if (-not $strictSubtitleDownload) {
+                $filebotParams += '-non-strict'
+            }
 
             # Add query hint if detected to help FileBot identify the series
             if ($queryHint) {
@@ -711,7 +749,7 @@ function Download-Subtitles {
 
             $isMismatch = $false
             if ($newSubs.Count -gt 0 -and $fetchedRelease) {
-                $isMismatch = -not (Test-SubtitleTitleMatch -VideoName $videoName -FetchedRelease $fetchedRelease)
+                $isMismatch = -not (Test-SubtitleTitleMatch -VideoName $videoName -FetchedRelease $fetchedRelease -StrictMode $strictSubtitleDownload)
             }
 
             if ($isMismatch) {
@@ -745,7 +783,7 @@ function Download-Subtitles {
                         $retryFetchedRelease = $retryFetchMatch.Groups[1].Value
                     }
 
-                    if ($newSubs.Count -gt 0 -and $retryFetchedRelease -and -not (Test-SubtitleTitleMatch -VideoName $videoName -FetchedRelease $retryFetchedRelease)) {
+                    if ($newSubs.Count -gt 0 -and $retryFetchedRelease -and -not (Test-SubtitleTitleMatch -VideoName $videoName -FetchedRelease $retryFetchedRelease -StrictMode $strictSubtitleDownload)) {
                         foreach ($sub in $newSubs) {
                             Remove-Item -LiteralPath $sub.FullName -Force -ErrorAction SilentlyContinue
                         }
@@ -793,7 +831,7 @@ function Download-Subtitles {
             } else {
                 Show-Format "INFO" "Overschakelen naar OpenSubtitles.com (API)" "Geen ondertitels gevonden via FileBot (.org)" -NameColor "Yellow"
             }
-            $subDownloaded = Download-SubtitleViaOpenSubtitlesCom -VideoPath $videoPath -AuthSettings $authSettings
+            $subDownloaded = Download-SubtitleViaOpenSubtitlesCom -VideoPath $videoPath -AuthSettings $authSettings -StrictMode $strictSubtitleDownload
             if ($subDownloaded) {
                 $acceptedCount++
             } else {
@@ -803,6 +841,11 @@ function Download-Subtitles {
 
         if (-not $subDownloaded) {
             $failedVideos += $videoName
+
+            if ($strictSubtitleDownload) {
+                Add-Content -Path $strictSkipSyncList -Value $videoPath
+                Show-Format "INFO" "Strict mode: STT-flow geactiveerd" "$videoName -> sync wordt later overgeslagen" -NameColor "Yellow"
+            }
         }
 
         $processedCount++

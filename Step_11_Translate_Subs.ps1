@@ -71,10 +71,13 @@ function Invoke-TranslateSubs {
         $videoName  = $video.BaseName
         $videoDir   = $video.DirectoryName
 
-        # Bepaal title prefix voor fuzzy matching (zelfde logica als Step_08)
-        $titlePrefix = if ($videoName -match '^(.+?\.\d{4})\.') {
+        # Prefixbeleid:
+        # 1) SxxEyy aanwezig => serie (episode-specifiek)
+        # 2) Anders jaar aanwezig => film
+        # 3) Anders volledige bestandsnaam
+        $titlePrefix = if ($videoName -match '(?i)^(.+?[\.\s_-]S\d{2}E\d{2})(?:[\.\s_-]|$)') {
             $matches[1]
-        } elseif ($videoName -match '^(.+?\.S\d{2}E\d{2})[\.\s]') {
+        } elseif ($videoName -match '^(.+?[\.\s_-]\d{4})(?:[\.\s_-]|$)') {
             $matches[1]
         } else {
             $videoName

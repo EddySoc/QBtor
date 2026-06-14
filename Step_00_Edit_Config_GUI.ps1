@@ -455,6 +455,9 @@ Write-Host "  EmbedForced: '$($config['Subtitles']['EmbedForced'])'"
 $controls['Subtitles_DownloadSubs'] = Add-ConfigCheckbox $panelSubs $y "Ondertitels downloaden (FileBot)" $config['Subtitles']['DownloadSubs'] "Uitvinken = stap 05 downloaden overslaan (handig als je subs al manueel hebt)"
 $y += 40
 
+$controls['Subtitles_StrictSubtitleDownload'] = Add-ConfigCheckbox $panelSubs $y "Strikte subtitle download" $config['Subtitles']['StrictSubtitleDownload'] "Aanvinken = alleen strikte titelmatch accepteren; bij geen match volgt STT + vertaling en wordt sync overgeslagen"
+$y += 40
+
 $controls['Subtitles_EmbedOnlyPrimary'] = Add-ConfigCheckbox $panelSubs $y "Alleen primaire taal embedden" $config['Subtitles']['EmbedOnlyPrimary'] "true = alleen eerste taal, false = alle talen"
 $y += 30
 $controls['Subtitles_EmbedDefault'] = Add-ConfigCheckbox $panelSubs $y "Primaire taal als default markeren" $config['Subtitles']['EmbedDefault'] "Stel eerste taal in als standaard ondertiteling"
