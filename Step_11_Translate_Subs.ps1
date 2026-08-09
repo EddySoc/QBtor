@@ -11,6 +11,83 @@ $Global:TranslateSubsLoaded = $true
 #   force    = altijd vertalen vanuit LangFallback, ook als er al een sub is
 #   off      = vertaling volledig uitschakelen
 
+# ─── Ollama-beheer functies ───────────────────────────────────────────
+function Test-OllamaRunning {
+    try {
+        $response = Invoke-WebRequest -Uri "http://127.0.0.1:11434/api/tags" `
+                                      -Method Get `
+                                      -TimeoutSec 2 `
+                                      -ErrorAction SilentlyContinue
+        return $response.StatusCode -eq 200
+    } catch {
+        return $false
+    }
+}
+
+function Start-OllamaService {
+    if (Test-OllamaRunning) {
+        Show-Format "INFO" "Ollama" "Service al actief" -NameColor "Yellow"
+        return $false  # retourneer $false = we hebben het niet gestart
+    }
+
+    Show-Format "INFO" "Ollama" "Service starten..." -NameColor "Yellow"
+    try {
+        # Probeer Ollama te starten via command line
+        $ollamaExe = "ollama"
+        if (Get-Command $ollamaExe -ErrorAction SilentlyContinue) {
+            Start-Process -FilePath $ollamaExe -ArgumentList "serve" -WindowStyle Hidden -NoNewWindow
+            Start-Sleep -Seconds 3
+            if (Test-OllamaRunning) {
+                Show-Format "INFO" "Ollama" "Service succesvol gestart" -NameColor "Green"
+                return $true  # retourneer $true = we hebben het gestart
+            }
+        }
+
+        # Als commando niet werkt, probeer direct het exe-pad
+        $possiblePaths = @(
+            "C:\Users\$env:USERNAME\AppData\Local\Programs\Ollama\ollama.exe",
+            "C:\Program Files\Ollama\ollama.exe",
+            "C:\Program Files (x86)\Ollama\ollama.exe"
+        )
+        foreach ($path in $possiblePaths) {
+            if (Test-Path $path) {
+                Start-Process -FilePath $path -ArgumentList "serve" -WindowStyle Hidden -NoNewWindow
+                Start-Sleep -Seconds 3
+                if (Test-OllamaRunning) {
+                    Show-Format "INFO" "Ollama" "Service succesvol gestart" -NameColor "Green"
+                    return $true  # retourneer $true = we hebben het gestart
+                }
+                break
+            }
+        }
+        
+        Show-Format "WARN" "Ollama" "Kon Ollama niet starten, toch proberen..." -NameColor "Yellow"
+        return $false
+    } catch {
+        Show-Format "WARN" "Ollama" "Fout bij starten: $_" -NameColor "Yellow"
+        return $false
+    }
+}
+
+function Stop-OllamaService {
+    if (-not (Test-OllamaRunning)) {
+        return
+    }
+
+    Show-Format "INFO" "Ollama" "Service stoppen..." -NameColor "Yellow"
+    try {
+        Get-Process -Name "ollama" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 1
+        if (-not (Test-OllamaRunning)) {
+            Show-Format "INFO" "Ollama" "Service gestopt" -NameColor "Green"
+        } else {
+            Show-Format "WARN" "Ollama" "Service loopt nog" -NameColor "Yellow"
+        }
+    } catch {
+        Show-Format "WARN" "Ollama" "Fout bij stoppen: $_" -NameColor "Yellow"
+    }
+}
+
 function Start-TranslateSubs {
     Start-StepLog -StepNumber "11" -StepName "Translate_Subs"
     Invoke-TranslateSubs
@@ -18,7 +95,7 @@ function Start-TranslateSubs {
 }
 
 function Invoke-TranslateSubs {
-    DrawBanner -Text "STEP 11 TRANSLATE SUBTITLES (ARGOS)"
+    DrawBanner -Text "STEP 11 TRANSLATE SUBTITLES"
 
     # --- Controleer TranslateMode
     $translateMode = if ($Global:TranslateMode) { $Global:TranslateMode.ToLower() } else { "fallback" }
@@ -56,6 +133,14 @@ function Invoke-TranslateSubs {
     $fallbackLangs = @(($Global:LangFallback -split ',') | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
 
     Show-Format "INFO" "Doeltaal: $targetLang" "Brontaal: $($fallbackLangs -join ', ')" -NameColor "Cyan"
+
+    # --- Controleer of Ollama nodig is en start het op als nodig
+    $translatorBackend = if ($Global:TranslatorBackend) { $Global:TranslatorBackend.ToLower() } else { 'argos' }
+    $ollamaWasStartedByScript = $false
+
+    if ($translatorBackend -eq 'ollama') {
+        $ollamaWasStartedByScript = Start-OllamaService
+    }
 
     # --- Loop over alle video's in TempDir
     $allVideos = @(Get-ChildItem -LiteralPath $Global:TempDir -Recurse -Filter "*.mkv" -File -ErrorAction SilentlyContinue |
@@ -139,7 +224,9 @@ function Invoke-TranslateSubs {
             continue
         }
 
-        Show-Format "TRANSLATE" "$($fbSub.Name)" "$fallbackLang -> $targetLang" -NameColor "Cyan"
+        $translatorOllamaModel = if ($Global:TranslatorOllamaModel) { $Global:TranslatorOllamaModel } else { 'mistral' }
+        $backendLabel = if ($translatorBackend -eq 'ollama') { 'Ollama' } elseif ($translatorBackend -eq 'argos') { 'Argos' } else { 'Auto (Argos eerst)' }
+        Show-Format "TRANSLATE" "$($fbSub.Name)" "$fallbackLang -> $targetLang [$backendLabel]" -NameColor "Cyan"
 
         # Zorg dat de generieke stream-reader geladen is (gedeeld met Step_06_STT)
         if (-not ([System.Management.Automation.PSTypeName]'WhisperOutputReader').Type) {
@@ -167,7 +254,7 @@ public class WhisperOutputReader {
 '@
         }
 
-        $translatorArgs = "--input `"$($fbSub.FullName)`" --output `"$translatedPath`" --from $fallbackLang --to $targetLang"
+        $translatorArgs = "--input `"$($fbSub.FullName)`" --output `"$translatedPath`" --from $fallbackLang --to $targetLang --backend $translatorBackend --ollama-model $translatorOllamaModel --ollama-base-url http://127.0.0.1:11434"
         if ($Global:TranslatorScript) {
             $scriptPrefix = "`"$($Global:TranslatorScript)`""
             if ($Global:TranslatorPackagesDir) { $scriptPrefix += " --packages-dir `"$($Global:TranslatorPackagesDir)`"" }
@@ -204,16 +291,9 @@ public class WhisperOutputReader {
 
                     if ($pct -ge 0 -and $pct -ne $lastPct) {
                         $lastPct = $pct
-                        $bar   = '#' * [int]($pct / 5)
-                        $empty = '-' * (20 - [int]($pct / 5))
-                        Write-Progress -Activity "Argos Translate" `
+                        Write-Progress -Activity "Translate subtitles" `
                                        -Status "$($fbSub.Name)  ($pct%)" `
-                                       -PercentComplete $pct
-                        Write-Host "`r  [TRANSLATE] [$bar$empty] $pct%  " -NoNewline -ForegroundColor Cyan
-                    } elseif ($line.Trim() -ne '' -and
-                              $line -notmatch 'RequestsDependencyWarning' -and
-                              $line -notmatch 'install chardet or charset_normalizer') {
-                        Write-Host "  [TRANSLATE] $($line.Trim())" -ForegroundColor DarkCyan
+                                       -PercentComplete $pct -ErrorAction SilentlyContinue
                     }
                 }
             }
@@ -225,8 +305,8 @@ public class WhisperOutputReader {
             $line = $null
             while ($readerObj.Lines.TryDequeue([ref]$line)) { $allLines.Add($line) }
         }
-        Write-Progress -Activity "Argos Translate" -Completed
-        Write-Host ""
+        Write-Progress -Activity "Translate subtitles" -Completed -ErrorAction SilentlyContinue
+        Write-Host ""  # Nieuwe regel na voortgangsbalk
         $stderr = $allLines -join "`n"
 
         if ($proc.ExitCode -eq 0 -and (Test-Path -LiteralPath $translatedPath)) {
@@ -240,6 +320,11 @@ public class WhisperOutputReader {
             $failedCount++
             $failedItems += $fbSub.Name
         }
+    }
+
+    # --- Stop Ollama als we het hebben gestart
+    if ($ollamaWasStartedByScript) {
+        Stop-OllamaService
     }
 
     Show-Format "SUMMARY" "Vertaling voltooid" "Vertaald: $translatedCount | Overgeslagen: $skippedCount" -NameColor "Cyan"

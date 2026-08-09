@@ -17,6 +17,8 @@ import argparse
 import json
 import re
 import sys
+import urllib.error
+import urllib.request
 import warnings
 from pathlib import Path
 
@@ -115,6 +117,92 @@ class _Ct2Translator:
         return decoded
 
 
+def _build_ollama_prompt(text, from_code, to_code):
+    return (
+        f"Translate the following subtitle dialogue from {from_code} to {to_code}. "
+        "Preserve the meaning, keep it natural, concise, and suitable for subtitles. "
+        "Do not translate literally word-for-word. Keep the tone and flow natural. "
+        "Do not include timestamps, line numbers, speaker labels, notes, explanations, or references to the source text. "
+        "Return only the translated subtitle text with no extra commentary. "
+        "Keep the same number of lines as the input.\n\n"
+        f"{text}"
+    )
+
+
+def _ollama_request(base_url, model, prompt, timeout=90):
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.2, "num_predict": 300},
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/api/generate",
+        data=data,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        body = json.load(response)
+    if isinstance(body, dict) and "response" in body:
+        return (body.get("response") or "").strip()
+    raise RuntimeError(f"Unexpected Ollama response: {body}")
+
+
+class _OllamaTranslator:
+    """Local subtitle-friendly translator via Ollama."""
+    def __init__(self, model, from_code, to_code, base_url="http://127.0.0.1:11434", timeout=90):
+        self._model = model
+        self._from_code = from_code
+        self._to_code = to_code
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+
+    def translate_batch(self, texts):
+        if not texts:
+            return []
+        results = []
+        for text in texts:
+            if not text or not text.strip():
+                results.append("")
+                continue
+            prompt = _build_ollama_prompt(text, self._from_code, self._to_code)
+            try:
+                results.append(_ollama_request(self._base_url, self._model, prompt, self._timeout))
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, RuntimeError):
+                results.append(text)
+        return results
+
+
+def _build_ollama_polish_prompt(text, from_code, to_code):
+    return (
+        f"Polish the following translated subtitle text from {from_code} to {to_code}. "
+        "Make it sound more natural for subtitles, more fluent, and more like natural spoken Dutch. "
+        "Keep the meaning the same, keep the text concise, and preserve the same number of lines. "
+        "Do not add explanations, notes, or timestamps. Return only the polished subtitle text.\n\n"
+        f"{text}"
+    )
+
+
+class _OllamaPolisher:
+    """Optional second pass that polishes subtitle wording using Ollama."""
+    def __init__(self, model, from_code, to_code, base_url="http://127.0.0.1:11434", timeout=90):
+        self._model = model
+        self._from_code = from_code
+        self._to_code = to_code
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+
+    def polish_text(self, text):
+        if not text or not text.strip():
+            return text
+        prompt = _build_ollama_polish_prompt(text, self._from_code, self._to_code)
+        try:
+            return _ollama_request(self._base_url, self._model, prompt, self._timeout)
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, RuntimeError):
+            return text
+
+
 class _ArgosTranslator:
     """One-by-one fallback using argostranslate (same batch interface)."""
     def __init__(self, at_translator):
@@ -162,37 +250,82 @@ def _strip_tags(line):
     return p, s[len(p):len(s) - len(q)].strip(), q
 
 
-def translate_entries(entries, translators, verbose=True):
-    """Collect all text, batch-translate in chunks, restore into entries."""
-    jobs = []
-    for ei, (_, _, text_lines) in enumerate(entries):
-        for li, line in enumerate(text_lines):
-            p, inner, q = _strip_tags(line)
-            if inner:
-                jobs.append((ei, li, p, inner, q))
+def _build_subtitle_block(text_lines):
+    return "\n".join(text_lines).strip()
 
-    if not jobs:
-        return list(entries)
 
-    inner_texts  = [j[3] for j in jobs]
-    chunk_size   = 150
-    total_chunks = max(1, (len(inner_texts) + chunk_size - 1) // chunk_size)
-    translated   = []
+def _sanitize_translated_block(text, expected_line_count):
+    if not text:
+        return []
 
-    for ci in range(total_chunks):
-        chunk   = inner_texts[ci * chunk_size:(ci + 1) * chunk_size]
-        current = chunk
+    cleaned = []
+    for line in text.replace('\r', '').splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        lower = stripped.lower()
+        if re.match(r'^\d+$', stripped):
+            continue
+        if re.match(r'^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}$', stripped):
+            continue
+        if '-->' in stripped and ':' in stripped:
+            continue
+        if re.search(r'\b(translation|translated|source|original|reference|note|context|subtitle|dialogue)\b', lower):
+            continue
+        if lower.startswith(("translation:", "translated:", "source:", "source text:", "original:", "original text:", "subtitle:", "subtitle text:", "note:", "context:")):
+            continue
+        if lower.startswith("this is") and "translation" in lower:
+            continue
+        if lower.startswith("the following") and "text" in lower:
+            continue
+
+        cleaned.append(stripped)
+
+    if not cleaned:
+        return []
+
+    if expected_line_count and expected_line_count > 0 and len(cleaned) > expected_line_count:
+        cleaned = cleaned[:expected_line_count]
+
+    return cleaned
+
+
+def translate_entries(entries, translators, verbose=True, polisher=None):
+    """Translate each subtitle block as a whole and optionally polish the wording."""
+    result = []
+    total = len(entries)
+    last_printed_pct = -1
+    
+    for idx, (index, timing, text_lines) in enumerate(entries, start=1):
+        block_text = _build_subtitle_block(text_lines)
+        if not block_text:
+            result.append((index, timing, text_lines))
+            continue
+
+        translated_block = block_text
         for tr in translators:
-            current = tr.translate_batch(current)
-        translated.extend(current)
-        if verbose:
-            print(f"{int((ci + 1) * 100 / total_chunks)}%", flush=True)
+            translated_block = tr.translate_batch([translated_block])[0]
 
-    job_map = {(j[0], j[1]): j[2] + translated[i] + j[4] for i, j in enumerate(jobs)}
-    result  = []
-    for ei, (index, timing, text_lines) in enumerate(entries):
-        new_lines = [job_map.get((ei, li), line) for li, line in enumerate(text_lines)]
-        result.append((index, timing, new_lines))
+        if polisher is not None:
+            translated_block = polisher.polish_text(translated_block)
+
+        if verbose:
+            current_pct = int(idx * 100 / total)
+            # Print elke 5% of elke 10 entries, zodat voortgang zichtbaar is
+            if current_pct != last_printed_pct or (idx % 10 == 0):
+                print(f"{current_pct}%", flush=True)
+                last_printed_pct = current_pct
+
+        translated_lines = _sanitize_translated_block(translated_block, len(text_lines))
+        if not translated_lines:
+            translated_lines = [block_text]
+        result.append((index, timing, translated_lines))
+    
+    # Zorg altijd dat 100% wordt geprint
+    if verbose and last_printed_pct != 100:
+        print("100%", flush=True)
+    
     return result
 
 # ── Argostranslate chain fallback ─────────────────────────────────────────────────────
@@ -218,14 +351,40 @@ def _find_argos_chain(languages, from_code, to_code):
 
 # ── Main ───────────────────────────────────────────────────────────────────────────────
 
+def _try_ollama_backend(from_code, to_code, model, base_url, timeout):
+    try:
+        translator = _OllamaTranslator(model, from_code, to_code, base_url, timeout)
+        sample = translator.translate_batch(["Hello world"])
+        if sample and sample[0]:
+            return [translator]
+    except Exception:
+        return None
+    return None
+
+
+def _try_ollama_polisher(from_code, to_code, model, base_url, timeout):
+    try:
+        polisher = _OllamaPolisher(model, from_code, to_code, base_url, timeout)
+        sample = polisher.polish_text("Hello world")
+        if sample and sample.strip():
+            return polisher
+    except Exception:
+        return None
+    return None
+
+
 def main():
-    parser = argparse.ArgumentParser(description='Translate SRT using Argos Translate (offline)')
+    parser = argparse.ArgumentParser(description='Translate SRT using Argos Translate or Ollama (offline)')
     parser.add_argument('--input',        required=True)
     parser.add_argument('--output',       required=True)
     parser.add_argument('--from',         dest='from_lang', required=True)
     parser.add_argument('--to',           dest='to_lang',   required=True)
     parser.add_argument('--quiet',        action='store_true')
     parser.add_argument('--packages-dir', dest='packages_dir', default=None)
+    parser.add_argument('--backend',      choices=['auto', 'argos', 'ollama'], default='argos')
+    parser.add_argument('--ollama-model', default='mistral')
+    parser.add_argument('--ollama-base-url', default='http://127.0.0.1:11434')
+    parser.add_argument('--ollama-timeout', type=int, default=90)
     args = parser.parse_args()
 
     if args.packages_dir:
@@ -235,36 +394,43 @@ def main():
     to_code   = normalize_lang(args.to_lang)
 
     translators = None
+    polisher = None
     chain_desc  = f"{from_code} -> {to_code}"
     pkg_dir     = _find_packages_dir(Path(args.packages_dir) if args.packages_dir else None)
 
-    if pkg_dir:
-        # 1. Direct pair
-        pkg = _find_package(pkg_dir, from_code, to_code)
-        if pkg:
-            try:
-                translators = [_Ct2Translator(*pkg)]
-            except Exception as e:
-                print(f"WARNING: ctranslate2 direct failed ({e})", file=sys.stderr)
-
-        # 2. Chain via English
-        if translators is None and from_code != 'en' and to_code != 'en':
-            pkg1 = _find_package(pkg_dir, from_code, 'en')
-            pkg2 = _find_package(pkg_dir, 'en', to_code)
-            if pkg1 and pkg2:
+    if args.backend in ('auto', 'argos'):
+        if pkg_dir:
+            # 1. Direct pair
+            pkg = _find_package(pkg_dir, from_code, to_code)
+            if pkg:
                 try:
-                    translators = [_Ct2Translator(*pkg1), _Ct2Translator(*pkg2)]
-                    chain_desc  = f"{from_code} -> en -> {to_code}"
+                    translators = [_Ct2Translator(*pkg)]
                 except Exception as e:
-                    print(f"WARNING: ctranslate2 chain failed ({e})", file=sys.stderr)
+                    print(f"WARNING: ctranslate2 direct failed ({e})", file=sys.stderr)
 
-    # 3. Fallback: argostranslate
-    if translators is None:
-        try:
-            import argostranslate.translate as at
-            translators, chain_desc = _find_argos_chain(at.get_installed_languages(), from_code, to_code)
-        except ImportError as e:
-            print(f"ERROR: argostranslate not available: {e}", file=sys.stderr)
+            # 2. Chain via English
+            if translators is None and from_code != 'en' and to_code != 'en':
+                pkg1 = _find_package(pkg_dir, from_code, 'en')
+                pkg2 = _find_package(pkg_dir, 'en', to_code)
+                if pkg1 and pkg2:
+                    try:
+                        translators = [_Ct2Translator(*pkg1), _Ct2Translator(*pkg2)]
+                        chain_desc  = f"{from_code} -> en -> {to_code}"
+                    except Exception as e:
+                        print(f"WARNING: ctranslate2 chain failed ({e})", file=sys.stderr)
+
+        # 3. Fallback: argostranslate
+        if translators is None:
+            try:
+                import argostranslate.translate as at
+                translators, chain_desc = _find_argos_chain(at.get_installed_languages(), from_code, to_code)
+            except ImportError as e:
+                print(f"ERROR: argostranslate not available: {e}", file=sys.stderr)
+
+    if translators is None and args.backend in ('auto', 'ollama'):
+        translators = _try_ollama_backend(from_code, to_code, args.ollama_model, args.ollama_base_url, args.ollama_timeout)
+        if translators and not args.quiet:
+            print(f"Using Ollama backend ({args.ollama_model}) for {from_code} -> {to_code}...")
 
     if not translators:
         print(f"ERROR: No translation model for {from_code} -> {to_code}.", file=sys.stderr)
@@ -272,6 +438,14 @@ def main():
             pkgs = [p.name for p in pkg_dir.iterdir() if p.is_dir()]
             print(f"       Packages: {', '.join(pkgs)}", file=sys.stderr)
         sys.exit(1)
+
+    if args.backend == 'ollama':
+        polisher = None
+    elif args.backend == 'auto':
+        # Keep the optional Ollama polish step disabled by default so Argos stays fully local.
+        polisher = None
+    else:
+        polisher = None
 
     try:
         with open(args.input, 'r', encoding='utf-8-sig') as f:
@@ -286,10 +460,15 @@ def main():
         sys.exit(1)
 
     if not args.quiet:
-        engine = "ctranslate2/batch" if isinstance(translators[0], _Ct2Translator) else "argostranslate"
+        if isinstance(translators[0], _OllamaTranslator):
+            engine = "ollama"
+        elif isinstance(translators[0], _Ct2Translator):
+            engine = "ctranslate2/batch"
+        else:
+            engine = "argostranslate"
         print(f"Translating {len(entries)} subtitle entries ({chain_desc}) [{engine}]...")
 
-    translated = translate_entries(entries, translators, verbose=not args.quiet)
+    translated = translate_entries(entries, translators, verbose=not args.quiet, polisher=polisher)
 
     try:
         write_srt(translated, args.output)

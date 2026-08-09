@@ -127,6 +127,8 @@ if ($Global:FFSubSyncExe -and -not [System.IO.Path]::IsPathRooted($Global:FFSubS
 if ($Global:TranslatorScript -and -not [System.IO.Path]::IsPathRooted($Global:TranslatorScript)) {
     $Global:TranslatorScript = Join-Path $Global:ScriptDir $Global:TranslatorScript
 }
+if (-not $Global:TranslatorBackend) { $Global:TranslatorBackend = 'argos' }
+if (-not $Global:TranslatorOllamaModel) { $Global:TranslatorOllamaModel = 'mistral' }
 if ($Global:FFmpegExe -and -not [System.IO.Path]::IsPathRooted($Global:FFmpegExe)) {
     $Global:FFmpegExe = Join-Path $Global:ScriptDir $Global:FFmpegExe
 }

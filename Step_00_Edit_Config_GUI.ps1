@@ -8,6 +8,7 @@ Add-Type -AssemblyName System.Drawing
 
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 $configFile = Join-Path $scriptPath "config.ini"
+$configDefaultsFile = Join-Path $scriptPath "config.example.ini"
 
 # Functie om config.ini te lezen
 function Read-ConfigFile {
@@ -79,10 +80,42 @@ function Write-ConfigFile {
     $originalLines = Get-Content $filePath -Encoding UTF8
     $newLines = @()
     $currentSection = ""
+    $sectionHeadersSeen = @{}
+    $sectionKeysSeen = @{}
+
+    function Add-MissingKeysForSection {
+        param(
+            [string]$sectionName,
+            [hashtable]$configData,
+            [hashtable]$disabledMap,
+            [hashtable]$seenMap,
+            [ref]$lineBuffer
+        )
+
+        if (-not $sectionName) { return }
+        if (-not $configData.ContainsKey($sectionName)) { return }
+
+        if (-not $seenMap.ContainsKey($sectionName)) {
+            $seenMap[$sectionName] = @{}
+        }
+
+        $missingKeys = @($configData[$sectionName].Keys | Where-Object { -not $seenMap[$sectionName].ContainsKey($_) })
+        foreach ($missingKey in $missingKeys) {
+            $missingValue = $configData[$sectionName][$missingKey]
+            $shouldDisable = $disabledMap.ContainsKey($sectionName) -and $disabledMap[$sectionName] -contains $missingKey
+
+            if ($shouldDisable) {
+                $lineBuffer.Value += "# $missingKey=$missingValue"
+            } else {
+                $lineBuffer.Value += "$missingKey=$missingValue"
+            }
+
+            $seenMap[$sectionName][$missingKey] = $true
+        }
+    }
     
     foreach ($line in $originalLines) {
         $trimmed = $line.Trim()
-        $originalTrimmed = $trimmed
         
         # Check of het een gecommentarieerde key-value is
         $isCommented = $trimmed.StartsWith("#")
@@ -98,7 +131,13 @@ function Write-ConfigFile {
         
         # Section header
         if ($trimmed -match '^\[(.+)\]$') {
+            Add-MissingKeysForSection -sectionName $currentSection -configData $config -disabledMap $disabledKeys -seenMap $sectionKeysSeen -lineBuffer ([ref]$newLines)
+
             $currentSection = $matches[1]
+            $sectionHeadersSeen[$currentSection] = $true
+            if (-not $sectionKeysSeen.ContainsKey($currentSection)) {
+                $sectionKeysSeen[$currentSection] = @{}
+            }
             $newLines += $line
             continue
         }
@@ -106,6 +145,11 @@ function Write-ConfigFile {
         # Key-value paar - update met nieuwe waarde
         if ($trimmed -match '^([^=]+)=(.*)$' -and $currentSection) {
             $key = $matches[1].Trim()
+            if (-not $sectionKeysSeen.ContainsKey($currentSection)) {
+                $sectionKeysSeen[$currentSection] = @{}
+            }
+            $sectionKeysSeen[$currentSection][$key] = $true
+
             if ($config.ContainsKey($currentSection) -and $config[$currentSection].ContainsKey($key)) {
                 $newValue = $config[$currentSection][$key]
                 
@@ -126,16 +170,93 @@ function Write-ConfigFile {
             $newLines += $line
         }
     }
+
+    # Flush missing keys for the final section in the file
+    Add-MissingKeysForSection -sectionName $currentSection -configData $config -disabledMap $disabledKeys -seenMap $sectionKeysSeen -lineBuffer ([ref]$newLines)
+
+    # Add missing sections (and their keys) that do not exist in the original file
+    foreach ($section in $config.Keys) {
+        if ($sectionHeadersSeen.ContainsKey($section)) { continue }
+
+        $newLines += ""
+        $newLines += "[$section]"
+
+        foreach ($key in $config[$section].Keys) {
+            $value = $config[$section][$key]
+            $shouldDisable = $disabledKeys.ContainsKey($section) -and $disabledKeys[$section] -contains $key
+
+            if ($shouldDisable) {
+                $newLines += "# $key=$value"
+            } else {
+                $newLines += "$key=$value"
+            }
+        }
+    }
     
     # Schrijf naar bestand (UTF8 zonder BOM)
     $utf8NoBom = New-Object System.Text.UTF8Encoding $false
     [System.IO.File]::WriteAllLines($filePath, $newLines, $utf8NoBom)
 }
 
+# Merge ontbrekende keys/secties vanuit defaults in actieve config
+function Merge-ConfigDefaults {
+    param(
+        [hashtable]$targetConfig,
+        [hashtable]$defaultsConfig,
+        [hashtable]$disabledConfig
+    )
+
+    $stats = [ordered]@{
+        AddedSections = 0
+        AddedKeys = 0
+        AddedItems = @()
+    }
+
+    if (-not $defaultsConfig) {
+        return $stats
+    }
+
+    foreach ($section in $defaultsConfig.Keys) {
+        if (-not $targetConfig.ContainsKey($section)) {
+            $targetConfig[$section] = @{}
+            $stats.AddedSections++
+        }
+
+        if (-not $disabledConfig.ContainsKey($section)) {
+            $disabledConfig[$section] = @()
+        }
+
+        foreach ($key in $defaultsConfig[$section].Keys) {
+            if (-not $targetConfig[$section].ContainsKey($key)) {
+                $targetConfig[$section][$key] = $defaultsConfig[$section][$key]
+                $stats.AddedKeys++
+                $stats.AddedItems += "$section.$key"
+            }
+        }
+    }
+
+    return $stats
+}
+
 # Lees config
 $configData = Read-ConfigFile -filePath $configFile
 $config = $configData.Config
 $disabledKeys = $configData.Disabled
+$defaultsMergeStats = [ordered]@{ AddedSections = 0; AddedKeys = 0; AddedItems = @(); DefaultsFound = $false }
+
+# Vul automatisch ontbrekende keys/secties aan vanuit config.example.ini.
+# Hierdoor verschijnen nieuwe instellingen automatisch in config.ini na opslaan.
+if (Test-Path $configDefaultsFile) {
+    $defaultsData = Read-ConfigFile -filePath $configDefaultsFile
+    $mergeStats = Merge-ConfigDefaults -targetConfig $config -defaultsConfig $defaultsData.Config -disabledConfig $disabledKeys
+    $defaultsMergeStats = [ordered]@{
+        AddedSections = $mergeStats.AddedSections
+        AddedKeys = $mergeStats.AddedKeys
+        AddedItems = $mergeStats.AddedItems
+        DefaultsFound = $true
+    }
+    Write-Host "DEBUG: Defaults merged from config.example.ini (sections: $($mergeStats.AddedSections), keys: $($mergeStats.AddedKeys))"
+}
 
 # Debug output - verwijder dit later
 Write-Host "DEBUG: Config loaded"
@@ -146,8 +267,8 @@ if ($config.ContainsKey('Subtitles')) {
     Write-Host "DEBUG: EmbedForced = '$($config['Subtitles']['EmbedForced'])'"
 }
 
-# NOTE: We do NOT add defaults here - only use existing values from config.ini
-# Defaults should only be applied by the actual processing scripts, not by the GUI
+# NOTE: GUI vult nu ontbrekende defaults aan vanuit config.example.ini.
+# Hierdoor kunnen nieuwe keys automatisch in config.ini terechtkomen na opslaan.
 
 # Maak globale tooltip provider
 $globalToolTip = New-Object System.Windows.Forms.ToolTip
@@ -757,6 +878,18 @@ $controls['Video_DownscaleAudio'] = Add-ConfigCombo $panelVideo $y "Audio Handli
 $y += 30
 $controls['Video_DownscaleBitrate'] = Add-ConfigField $panelVideo $y "Bitrate:" $config['Video']['DownscaleBitrate'] "bijv. 5M voor 1080p, 3M voor 720p, leeg voor CRF" 150
 $y += 30
+$controls['Video_DownscaleMaxWidth'] = Add-ConfigField $panelVideo $y "Max Width:" $config['Video']['DownscaleMaxWidth'] "TV-safe max breedte bij keep (1920 aanbevolen, 0=uit)" 120
+$y += 30
+$controls['Video_DownscaleFallbackToH264'] = Add-ConfigCheckbox $panelVideo $y "H.264 fallback inschakelen (alleen bij tv-risky brede video)" $config['Video']['DownscaleFallbackToH264'] "true=gebruik fallback, false=alleen normale downscale"
+$y += 40
+$controls['Video_DownscaleFallbackH264Mode'] = Add-ConfigCombo $panelVideo $y "Fallback Mode:" $config['Video']['DownscaleFallbackH264Mode'] @('direct', 'separate', 'replace') "direct=skip HEVC en direct H.264 | separate=HEVC + extra H.264 | replace=HEVC vervangen door H.264"
+$y += 30
+$controls['Video_DownscaleFallbackH264Encoder'] = Add-ConfigCombo $panelVideo $y "Fallback H.264 Encoder:" $config['Video']['DownscaleFallbackH264Encoder'] @('nvidia', 'amd', 'cpu') "Encoder voor H.264 fallback"
+$y += 30
+$controls['Video_DownscaleFallbackH264Preset'] = Add-ConfigCombo $panelVideo $y "Fallback H.264 Preset:" $config['Video']['DownscaleFallbackH264Preset'] @('ultrafast', 'fast', 'medium', 'slow') "Preset voor H.264 fallback"
+$y += 30
+$controls['Video_DownscaleFallbackH264CRF'] = Add-ConfigField $panelVideo $y "Fallback H.264 CRF:" $config['Video']['DownscaleFallbackH264CRF'] "18=hoog, 23=aanbevolen, 28=kleiner bestand" 120
+$y += 30
 $controls['Video_ForceAspectRatio'] = Add-ConfigCombo $panelVideo $y "Aspect Ratio:" $config['Video']['ForceAspectRatio'] @('', '16:9', '4:3', 'keep') "(leeg)=auto-detect (AANBEVOLEN), 16:9=breedbeeld, 4:3=vierkant, keep=behoud origineel"
 
 # ============================================================================
@@ -793,6 +926,10 @@ $y += 30
 $controls['Executables_TranslatorScript'] = Add-ConfigField $panelTools $y "Translator Script (.py):" $config['Executables']['TranslatorScript'] "C:\QBtor\translate_srt_argos.py" 300
 $y += 30
 $controls['Executables_TranslatorPackagesDir'] = Add-ConfigField $panelTools $y "Translator Packages Dir:" $config['Executables']['TranslatorPackagesDir'] "C:\Video\translate_srt_argos\argos-packages" 300
+$y += 30
+$controls['Executables_TranslatorBackend'] = Add-ConfigCombo $panelTools $y "Translator Backend:" $config['Executables']['TranslatorBackend'] @('auto', 'argos', 'ollama') "auto=probeer Argos eerst, anders Ollama | ollama=alleen Ollama | argos=alleen Argos" 300
+$y += 30
+$controls['Executables_TranslatorOllamaModel'] = Add-ConfigField $panelTools $y "Translator Ollama Model:" $config['Executables']['TranslatorOllamaModel'] "mistral" 300
 $y += 30
 $controls['Executables_STTExe'] = Add-ConfigField $panelTools $y "Whisper STT Exe:" $config['Executables']['STTExe'] "C:\Video\whisper\whisper.exe" 300
 
@@ -884,6 +1021,52 @@ $controls['Monitoring_MonitoringInterval'] = Add-ConfigField $panelDebug $y "Int
 # ============================================================================
 # Buttons
 # ============================================================================
+$labelDefaultsStatus = New-Object System.Windows.Forms.Label
+$labelDefaultsStatus.Location = New-Object System.Drawing.Point(10, 627)
+$labelDefaultsStatus.Size = New-Object System.Drawing.Size(560, 20)
+$labelDefaultsStatus.ForeColor = [System.Drawing.Color]::DarkSlateGray
+$labelDefaultsStatus.Font = New-Object System.Drawing.Font("Arial", 8)
+
+if ($defaultsMergeStats.DefaultsFound) {
+    $labelDefaultsStatus.Text = "Auto-defaults: +$($defaultsMergeStats.AddedKeys) key(s), +$($defaultsMergeStats.AddedSections) sectie(s) uit config.example.ini"
+} else {
+    $labelDefaultsStatus.Text = "Auto-defaults: config.example.ini niet gevonden"
+}
+
+$form.Controls.Add($labelDefaultsStatus)
+
+$buttonDefaultsDetails = New-Object System.Windows.Forms.Button
+$buttonDefaultsDetails.Location = New-Object System.Drawing.Point(490, 620)
+$buttonDefaultsDetails.Size = New-Object System.Drawing.Size(80, 30)
+$buttonDefaultsDetails.Text = "Details"
+
+if (-not $defaultsMergeStats.DefaultsFound -or $defaultsMergeStats.AddedKeys -eq 0) {
+    $buttonDefaultsDetails.Enabled = $false
+    $globalToolTip.SetToolTip($buttonDefaultsDetails, "Geen toegevoegde defaults om te tonen")
+} else {
+    $globalToolTip.SetToolTip($buttonDefaultsDetails, "Toon welke secties/keys automatisch zijn toegevoegd")
+}
+
+$buttonDefaultsDetails.Add_Click({
+    if (-not $defaultsMergeStats.DefaultsFound) {
+        [System.Windows.Forms.MessageBox]::Show("config.example.ini niet gevonden.", "Auto-defaults details", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        return
+    }
+
+    if (-not $defaultsMergeStats.AddedItems -or $defaultsMergeStats.AddedItems.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Geen nieuwe defaults toegevoegd in deze sessie.", "Auto-defaults details", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+        return
+    }
+
+    $detailsHeader = "Toegevoegde defaults uit config.example.ini:`n"
+    $detailsBody = ($defaultsMergeStats.AddedItems | Sort-Object | ForEach-Object { " - $_" }) -join "`n"
+    $detailsText = "$detailsHeader`n$detailsBody"
+
+    [System.Windows.Forms.MessageBox]::Show($detailsText, "Auto-defaults details", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+})
+
+$form.Controls.Add($buttonDefaultsDetails)
+
 $buttonSave = New-Object System.Windows.Forms.Button
 $buttonSave.Location = New-Object System.Drawing.Point(580, 620)
 $buttonSave.Size = New-Object System.Drawing.Size(90, 30)
@@ -919,6 +1102,10 @@ $buttonSave.Add_Click({
         }
 
         # Standaard gedrag voor andere secties
+        if (-not $config.ContainsKey($section)) {
+            $config[$section] = @{}
+        }
+
         if ($control -is [System.Windows.Forms.TextBox]) {
             $config[$section][$setting] = $control.Text
         } elseif ($control -is [System.Windows.Forms.ComboBox]) {

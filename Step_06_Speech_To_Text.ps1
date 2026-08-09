@@ -197,26 +197,69 @@ function Invoke-STT {
         $videoName = $video.BaseName
         $videoDir  = $video.DirectoryName
 
-        # Controleer of er al een sub bestaat voor exact dit videobestand (elke taal).
-        # Gebruik geen serie-brede prefix, anders kan E02 ten onrechte E01 matchen.
-        $existingSubs = @(Get-ChildItem -LiteralPath $videoDir -File -Filter "*.srt" -ErrorAction SilentlyContinue |
-                          Where-Object { $_.BaseName -match "^$([regex]::Escape($videoName))(\.|$)" })
+        # Title prefix (zelfde logica als stap 10/11)
+        $titlePrefix = if ($videoName -match '^(.+?\.\d{4})\.') {
+            $matches[1]
+        } elseif ($videoName -match '^(.+?\.S\d{2}E\d{2})[\.\s]') {
+            $matches[1]
+        } else {
+            $videoName
+        }
 
-        if ($existingSubs.Count -gt 0) {
-            $taggedName  = "$videoName.$subLangTag.srt"
-            # Hernoem ongetagde sub (geen taalcode in naam) naar correct taalgelabelde versie
-            $untaggedSub = $existingSubs | Where-Object { $_.Name -eq "$videoName.srt" }
-            if ($untaggedSub -and -not ($existingSubs | Where-Object { $_.Name -eq $taggedName })) {
-                Rename-Item -LiteralPath $untaggedSub.FullName -NewName $taggedName -Force -ErrorAction SilentlyContinue
-                Show-Format "SKIP" "$videoName" "Ongetagde sub hernoemd naar $taggedName, STT overgeslagen" -NameColor "Yellow"
-            } else {
-                Show-Format "SKIP" "$videoName" "Sub reeds aanwezig: $($existingSubs[0].Name)" -NameColor "DarkGray"
+        # Controleer of deze video door stap 05 als 'geen exacte ondertitel te downloaden' is gemarkeerd.
+        # Alleen dan mag STT worden gestart.
+        $noSubListPath = if ($Global:NoSubList) { $Global:NoSubList } elseif ($NoSubList) { $NoSubList } else { Join-Path $Global:LogDir "nosub_list.txt" }
+        $sttRequired = $false
+        if (Test-Path -LiteralPath $noSubListPath) {
+            $requiredVideos = @(Get-Content -LiteralPath $noSubListPath -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() })
+            $sttRequired = $requiredVideos -contains $video.FullName
+        }
+
+        # Controleer of er al een sub bestaat (elke taal)
+        $existingSubs = @(Get-ChildItem -LiteralPath $videoDir -File -Filter "*.srt" -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Name -like "$titlePrefix*.srt" })
+
+        $translateMode = if ($Global:TranslateMode) { $Global:TranslateMode.ToLower() } else { "fallback" }
+        $fallbackLangs = if ($translateMode -ne 'off' -and $Global:LangFallback) {
+            @(($Global:LangFallback -split ',') | ForEach-Object { $_.Trim().ToLower() } | Where-Object { $_ })
+        } else {
+            @()
+        }
+        $existingFallbackSubs = if ($fallbackLangs.Count -gt 0) {
+            @($existingSubs | Where-Object {
+                $subLang = Get-SubtitleLanguage $_.Name
+                $fallbackLangs -contains $subLang
+            })
+        } else {
+            @()
+        }
+
+        if (-not $sttRequired) {
+            if ($existingSubs.Count -gt 0) {
+                $taggedName  = "$videoName.$subLangTag.srt"
+                # Hernoem ongetagde sub (geen taalcode in naam) naar correct taalgelabelde versie
+                $untaggedSub = $existingSubs | Where-Object { $_.Name -eq "$videoName.srt" }
+                if ($untaggedSub -and -not ($existingSubs | Where-Object { $_.Name -eq $taggedName })) {
+                    Rename-Item -LiteralPath $untaggedSub.FullName -NewName $taggedName -Force -ErrorAction SilentlyContinue
+                    Show-Format "SKIP" "$videoName" "Ongetagde sub hernoemd naar $taggedName, STT overgeslagen" -NameColor "Yellow"
+                } else {
+                    Show-Format "SKIP" "$videoName" "Sub reeds aanwezig: $($existingSubs[0].Name)" -NameColor "DarkGray"
+                }
+                $skippedCount++
+                continue
             }
+
+            # Geen marker uit stap 05 en geen bestaande sub → STT uitvoeren als fallback
+            $sttRequired = $true
+        }
+
+        if ($sttRequired -and $existingFallbackSubs.Count -gt 0) {
+            Show-Format "SKIP" "$videoName" "Bron-sub aanwezig ($($existingFallbackSubs[0].Name)); STT overgeslagen, vertaling volgt" -NameColor "DarkGray"
             $skippedCount++
             continue
         }
 
-        # Geen sub → STT uitvoeren
+        # STT uitvoeren wanneer stap 05 geen downloadbare doeltaal-sub vond EN er ook geen brontaal-sub is om te vertalen
         Show-Format "STT" "$videoName" "Whisper transcriptie starten (model: $model)" -NameColor "Cyan"
 
         # Whisper schrijft: <basename>.srt in de output_dir

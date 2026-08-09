@@ -992,6 +992,7 @@ function Start-DownloadSubs {
     }
 # --- Dynamisch afgeleide paden
 $NoSubList    = Join-Path $LogDir "nosub_list.txt"
+$Global:NoSubList = $NoSubList
 # --- Uitvoering
 Check-FileBotConfig
 Get-MissingSubtitles

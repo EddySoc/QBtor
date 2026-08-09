@@ -61,6 +61,34 @@ function Show-Error   { param ($msg) Write-Host "[ERROR     ] $msg" -ForegroundC
 function Show-Info    { param ($msg) Write-Host "[INFO      ] $msg" -ForegroundColor Cyan }
 function Show-Debug   { param ($msg) Write-Host "[DEBUG     ] $msg" -ForegroundColor DarkGray }
 
+function Write-LogEntry {
+    param(
+        [string]$LogFile,
+        [string]$Message
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LogFile) -or [string]::IsNullOrWhiteSpace($Message)) {
+        return
+    }
+
+    # Step logs are transcript files and can be locked for direct Add-Content.
+    if ($Global:CurrentStepLogFile -and ($LogFile -eq $Global:CurrentStepLogFile)) {
+        Write-Host $Message
+        return
+    }
+
+    try {
+        Add-Content -Path $LogFile -Value $Message -ErrorAction Stop
+    } catch {
+        try {
+            Start-Sleep -Milliseconds 120
+            Add-Content -Path $LogFile -Value $Message -ErrorAction Stop
+        } catch {
+            # Ignore log write failures; do not break conversion flow.
+        }
+    }
+}
+
 #*********************************************************************************************
 #      Resource Monitoring
 #*********************************************************************************************
@@ -368,6 +396,52 @@ function Get-StepExtraSummaryText {
     return ''
 }
 
+# ─── Helper functie voor gekleurd stap-resultaat ───────────────────────────
+function Get-StepResultColor {
+    param (
+        [int]$Success,
+        [int]$Failed,
+        [int]$Skipped
+    )
+    
+    # Prioriteit: Failed > Success > Skipped > None
+    if ($Failed -gt 0) {
+        return "Red"      # Fouten: kritiek
+    } elseif ($Success -gt 0) {
+        return "Green"    # Succes
+    } elseif ($Skipped -gt 0) {
+        return "Yellow"   # Overgeslagen
+    } else {
+        return "White"    # Niks gedaan
+    }
+}
+
+# ─── Helper functie voor gekleurd resultaatformat per kolom ─────────────────
+function Format-StepResultWithColors {
+    param (
+        [int]$Success,
+        [int]$Failed,
+        [int]$Skipped
+    )
+    
+    # ANSI kleurcodes
+    $colors = @{
+        "Green"  = "`e[32m"
+        "Red"    = "`e[31m"
+        "Yellow" = "`e[33m"
+        "White"  = "`e[37m"
+    }
+    $reset = "`e[0m"
+    
+    # Bepaal kleur per waarde
+    $successColor = if ($Success -gt 0) { $colors["Green"] } else { $colors["White"] }
+    $failedColor  = if ($Failed -gt 0) { $colors["Red"] } else { $colors["White"] }
+    $skippedColor = if ($Skipped -gt 0) { $colors["Yellow"] } else { $colors["White"] }
+    
+    # Bouw gekleurd string - label EN getal in dezelfde kleur
+    return "$($successColor)Success=$Success$reset | $($failedColor)Failed=$Failed$reset | $($skippedColor)Skipped=$Skipped$reset"
+}
+
 function Show-StepRunSummary {
     DrawBanner -Text "PIPELINE RESULT SUMMARY"
 
@@ -388,20 +462,24 @@ function Show-StepRunSummary {
             $metaSuccess = if ("$($noteData['metadataSuccess'])" -match '^\d+$') { [int]$noteData['metadataSuccess'] } else { 0 }
             $metaFailed = if ("$($noteData['metadataFailed'])" -match '^\d+$') { [int]$noteData['metadataFailed'] } else { 0 }
             $metaSkipped = if ("$($noteData['metadataSkipped'])" -match '^\d+$') { [int]$noteData['metadataSkipped'] } else { 0 }
-            Show-Format "STEP $step" "[$(Get-StepSummaryLabel -Step $step)]" "Success=$metaSuccess | Failed=$metaFailed | Skipped=$metaSkipped" -NameColor "Cyan"
+            
+            # Gebruik gekleurd format voor elke kolom apart
+            $coloredInfo1 = Format-StepResultWithColors -Success $metaSuccess -Failed $metaFailed -Skipped $metaSkipped
+            Show-Format "STEP $step" "[$(Get-StepSummaryLabel -Step $step)]" $coloredInfo1 -NameColor "Cyan" -InfoColor "White"
 
             if ($noteData.ContainsKey('mode')) {
                 $modeLabel = Get-StepSummaryLabel -Step $step -Mode "$($noteData['mode'])"
-                Show-Format "STEP $step" "[$modeLabel]" "Success=$($entry.Success) | Failed=$($entry.Failed) | Skipped=$skipped" -NameColor "Cyan"
+                $coloredInfo2 = Format-StepResultWithColors -Success $entry.Success -Failed $entry.Failed -Skipped $skipped
+                Show-Format "STEP $step" "[$modeLabel]" $coloredInfo2 -NameColor "Cyan" -InfoColor "White"
             }
         } else {
             $label = Get-StepSummaryLabel -Step $step
-            $info = "Success=$($entry.Success) | Failed=$($entry.Failed) | Skipped=$skipped"
+            $coloredInfo = Format-StepResultWithColors -Success $entry.Success -Failed $entry.Failed -Skipped $skipped
             $extraText = Get-StepExtraSummaryText -Step $step -Entry $entry -NoteData $noteData
             if ($extraText) {
-                $info += " | $extraText"
+                $coloredInfo += " | $extraText"
             }
-            Show-Format "STEP $step" "[$label]" $info -NameColor "Cyan"
+            Show-Format "STEP $step" "[$label]" $coloredInfo -NameColor "Cyan" -InfoColor "White"
         }
 
         if ($entry.FailedItems -and $entry.FailedItems.Count -gt 0) {
@@ -1189,7 +1267,8 @@ function Split-SubtitleTextLines {
         [int]$MaxLines = 0
     )
 
-    $cleanText = [regex]::Replace(($Text ?? ''), '\s+', ' ').Trim()
+    $textToClean = if ([string]::IsNullOrEmpty($Text)) { '' } else { $Text }
+    $cleanText = [regex]::Replace($textToClean, '\s+', ' ').Trim()
     if ([string]::IsNullOrWhiteSpace($cleanText)) {
         return @('')
     }
@@ -1199,10 +1278,30 @@ function Split-SubtitleTextLines {
     }
 
     $words = $cleanText -split ' '
+    $expandedWords = [System.Collections.Generic.List[string]]::new()
+    foreach ($word in $words) {
+        if ([string]::IsNullOrWhiteSpace($word)) { continue }
+
+        if ($word.Length -le $MaxCharsPerLine) {
+            $expandedWords.Add($word)
+            continue
+        }
+
+        # Hard split for single long tokens so one line can never grow too wide.
+        $remaining = $word
+        while ($remaining.Length -gt $MaxCharsPerLine) {
+            $expandedWords.Add($remaining.Substring(0, $MaxCharsPerLine))
+            $remaining = $remaining.Substring($MaxCharsPerLine)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($remaining)) {
+            $expandedWords.Add($remaining)
+        }
+    }
+
     $lines = [System.Collections.Generic.List[string]]::new()
     $currentLine = ''
 
-    foreach ($word in $words) {
+    foreach ($word in $expandedWords) {
         if ([string]::IsNullOrWhiteSpace($word)) { continue }
 
         if ([string]::IsNullOrWhiteSpace($currentLine)) {
@@ -1232,7 +1331,11 @@ function Split-SubtitleTextLines {
         $result.Add($lines[$i])
     }
 
+    # Keep the final allowed line readable and capped to the configured width.
     $overflow = (($lines | Select-Object -Skip ($MaxLines - 1)) -join ' ').Trim()
+    if ($overflow.Length -gt $MaxCharsPerLine) {
+        $overflow = $overflow.Substring(0, $MaxCharsPerLine - 3).TrimEnd() + '...'
+    }
     $result.Add($overflow)
     return @($result)
 }
@@ -1340,6 +1443,8 @@ function Convert-H265ToH264WithAAC {
         
         [ValidateSet("nvidia", "amd", "cpu")]
         [string]$Encoder = "nvidia",
+
+        [string]$VideoFilter = "",
         
         [string]$AspectRatio = "",
         
@@ -1443,9 +1548,16 @@ function Convert-H265ToH264WithAAC {
                 $ffmpegArgs += @("-pix_fmt", "yuv420p")
             }
             
-            # Add aspect ratio filter if specified
+            # Build filter chain (optional scale/crop + optional DAR override)
+            $filterChain = @()
+            if (-not [string]::IsNullOrWhiteSpace($VideoFilter)) {
+                $filterChain += $VideoFilter
+            }
             if ($AspectRatio -and $AspectRatio -ne "keep" -and $AspectRatio -ne "") {
-                $ffmpegArgs += @("-vf", "setdar=$AspectRatio")
+                $filterChain += "setdar=$AspectRatio"
+            }
+            if ($filterChain.Count -gt 0) {
+                $ffmpegArgs += @("-vf", ($filterChain -join ","))
             }
             
             # Add remaining parameters - use temp file for output
@@ -1545,7 +1657,7 @@ function Convert-H265ToH264WithAAC {
                 
                 $errorSummary = if ($errorLines) { $errorLines -join " | " } else { "Exit code $exitCode" }
                 $logMessage = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ❌ $InputFileDisplay -> FFmpeg failed | Encoder: $enc | Error: $errorSummary"
-                if ($LogFile) { Add-Content -Path $LogFile -Value $logMessage }
+                if ($LogFile) { Write-LogEntry -LogFile $LogFile -Message $logMessage }
                 
                 # Clean up invalid temp file
                 Remove-Item $tempOutput -ErrorAction SilentlyContinue
@@ -1566,12 +1678,12 @@ function Convert-H265ToH264WithAAC {
                 $errorSummary = if ($errorLines) { $errorLines -join " | " } else { "No specific error found in ffmpeg output" }
                 
                 $logMessage = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ❌ $InputFileDisplay -> Output file not created | Error: $errorSummary"
-                if ($LogFile) { Add-Content -Path $LogFile -Value $logMessage }
+                if ($LogFile) { Write-LogEntry -LogFile $LogFile -Message $logMessage }
                 
                 if ($enc -ne "cpu") {
                     Write-Host "⚠️  $enc failed, falling back to CPU..." -ForegroundColor Yellow
                     $logMessage = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ⚠️  $InputFileDisplay | $enc failed (no output), trying CPU fallback"
-                    if ($LogFile) { Add-Content -Path $LogFile -Value $logMessage }
+                    if ($LogFile) { Write-LogEntry -LogFile $LogFile -Message $logMessage }
                     continue
                 }
                 return
@@ -1602,7 +1714,7 @@ function Convert-H265ToH264WithAAC {
                     Write-Host "✅ Klaar ($enc): $InputFileDisplay replaced with H.264 [${elapsedTime}s]" -ForegroundColor Green
                     
                     if ($LogFile) {
-                        Add-Content -Path $LogFile -Value $logMessage
+                        Write-LogEntry -LogFile $LogFile -Message $logMessage
                     }
                     
                     # Also rename any associated subtitle files (remove .h264 from name)
@@ -1623,7 +1735,7 @@ function Convert-H265ToH264WithAAC {
                 } catch {
                     Write-Host "❌ Kon bestand niet vervangen: $_" -ForegroundColor Red
                     $logMessage = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ❌ $InputFileDisplay -> Failed to replace original file"
-                    if ($LogFile) { Add-Content -Path $LogFile -Value $logMessage }
+                    if ($LogFile) { Write-LogEntry -LogFile $LogFile -Message $logMessage }
                     Remove-Item $tempOutput -ErrorAction SilentlyContinue
                     return
                 }
@@ -1632,7 +1744,7 @@ function Convert-H265ToH264WithAAC {
                 Write-Host "⚠️  $enc failed (codec: $outputCodec), falling back to CPU..." -ForegroundColor Yellow
                 
                 if ($LogFile) {
-                    Add-Content -Path $LogFile -Value $logMessage
+                    Write-LogEntry -LogFile $LogFile -Message $logMessage
                 }
                 # Remove failed temp file
                 Remove-Item $tempOutput -ErrorAction SilentlyContinue
@@ -1642,7 +1754,7 @@ function Convert-H265ToH264WithAAC {
                 Write-Host "❌ Mislukt: codec=$outputCodec (expected h264)" -ForegroundColor Red
                 
                 if ($LogFile) {
-                    Add-Content -Path $LogFile -Value $logMessage
+                    Write-LogEntry -LogFile $LogFile -Message $logMessage
                 }
                 # Remove failed temp file
                 Remove-Item $tempOutput -ErrorAction SilentlyContinue
@@ -1650,7 +1762,7 @@ function Convert-H265ToH264WithAAC {
                 if ($enc -ne "cpu") {
                     Write-Host "⚠️  Falling back to CPU..." -ForegroundColor Yellow
                     $logMessage = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] ⚠️  $InputFileDisplay | Invalid codec from $enc, trying CPU fallback"
-                    if ($LogFile) { Add-Content -Path $LogFile -Value $logMessage }
+                    if ($LogFile) { Write-LogEntry -LogFile $LogFile -Message $logMessage }
                     continue
                 }
                 return
@@ -1793,6 +1905,8 @@ function Convert-HighBitDepthToH265 {
         
         [string]$AspectRatio = "",
         
+        [int]$MaxWidth = 0,
+        
         [string]$LogFile = ""
     )
     
@@ -1805,6 +1919,39 @@ function Convert-HighBitDepthToH265 {
     if ([string]::IsNullOrWhiteSpace($Audio)) { $Audio = $Global:DownscaleAudio }
     if ([string]::IsNullOrWhiteSpace($Bitrate)) { $Bitrate = $Global:DownscaleBitrate }
     if ([string]::IsNullOrWhiteSpace($AspectRatio)) { $AspectRatio = $Global:ForceAspectRatio }
+    if ($MaxWidth -le 0) {
+        if ($Global:DownscaleMaxWidth -gt 0) {
+            $MaxWidth = [int]$Global:DownscaleMaxWidth
+        } else {
+            $MaxWidth = 1920
+        }
+    }
+
+    # Optional compatibility fallback: after HEVC conversion, re-encode to H.264 for TV safety
+    $fallbackToH264Enabled = $false
+    if ($null -ne $Global:DownscaleFallbackToH264) {
+        $fallbackToH264Enabled = [bool]$Global:DownscaleFallbackToH264
+    }
+
+    $fallbackH264Encoder = if ([string]::IsNullOrWhiteSpace($Global:DownscaleFallbackH264Encoder)) { "nvidia" } else { $Global:DownscaleFallbackH264Encoder }
+    if ($fallbackH264Encoder -notin @("nvidia", "amd", "cpu")) {
+        $fallbackH264Encoder = "nvidia"
+    }
+
+    $fallbackH264Preset = if ([string]::IsNullOrWhiteSpace($Global:DownscaleFallbackH264Preset)) { "fast" } else { $Global:DownscaleFallbackH264Preset }
+    if ($fallbackH264Preset -notin @("ultrafast", "fast", "medium", "slow")) {
+        $fallbackH264Preset = "fast"
+    }
+
+    $fallbackH264CRF = 23
+    if ($Global:DownscaleFallbackH264CRF -is [int] -and $Global:DownscaleFallbackH264CRF -ge 18 -and $Global:DownscaleFallbackH264CRF -le 28) {
+        $fallbackH264CRF = [int]$Global:DownscaleFallbackH264CRF
+    }
+
+    $fallbackH264Mode = if ([string]::IsNullOrWhiteSpace($Global:DownscaleFallbackH264Mode)) { "separate" } else { $Global:DownscaleFallbackH264Mode.ToLower() }
+    if ($fallbackH264Mode -notin @("separate", "replace", "direct")) {
+        $fallbackH264Mode = "separate"
+    }
 
     if (-not (Test-Path -LiteralPath $InputFile)) {
         Write-Host "❌ Bestand niet gevonden: $InputFile" -ForegroundColor Red
@@ -1859,16 +2006,50 @@ function Convert-HighBitDepthToH265 {
     }
 
     # Determine scale filter based on resolution and scaling algorithm
+    $autoWidthCapped = $false
     if ($Resolution -eq "keep") {
-        # Keep original resolution, no scaling
-        $scaleFilter = ""
-        $targetWidth = $currentWidth
-        $targetHeight = $currentHeight
+        # Keep original resolution unless it exceeds configured TV-safe max width
+        if ($MaxWidth -gt 0 -and $currentWidth -gt $MaxWidth) {
+            $targetWidth = $MaxWidth
+            $rawTargetHeight = [math]::Round(($currentHeight * $targetWidth) / $currentWidth)
+            # yuv420p requires even dimensions; ensure at least 2 pixels high
+            if ($rawTargetHeight -lt 2) { $rawTargetHeight = 2 }
+            if (($rawTargetHeight % 2) -ne 0) { $rawTargetHeight -= 1 }
+            $targetHeight = $rawTargetHeight
+            $scaleFilter = "scale=${targetWidth}:${targetHeight}:flags=${Scaling}"
+            $autoWidthCapped = $true
+            Show-Format "TV SAFE" "$InputFileDisplay" "Width ${currentWidth}px > ${MaxWidth}px, auto-scale to ${targetWidth}x${targetHeight}" -NameColor "Yellow"
+        } else {
+            $scaleFilter = ""
+            $targetWidth = $currentWidth
+            $targetHeight = $currentHeight
+        }
     } else {
         # Scale to target resolution
         $targetWidth = if ($Resolution -eq "1080p") { 1920 } else { 1280 }
         $targetHeight = if ($Resolution -eq "1080p") { 1080 } else { 720 }
         $scaleFilter = "scale=${targetWidth}:${targetHeight}:flags=${Scaling}"
+    }
+
+    # Direct mode: when enabled, skip HEVC pass and go straight to H.264 for TV-risky wide sources.
+    if ($fallbackToH264Enabled -and $autoWidthCapped -and $fallbackH264Mode -eq "direct") {
+        Show-Format "TV SAFE" "$InputFileDisplay" "Direct H.264 mode active; skipping HEVC pass" -NameColor "Yellow"
+        Convert-H265ToH264WithAAC -InputFile $InputFile -Preset $fallbackH264Preset -CRF $fallbackH264CRF -Encoder $fallbackH264Encoder -VideoFilter $scaleFilter -AspectRatio $AspectRatio -LogFile ""
+
+        $directCodec = ""
+        try {
+            $directCodec = (& $Global:FFprobeExe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 $InputFile 2>$null).Trim()
+        } catch {
+            $directCodec = ""
+        }
+
+        if ($directCodec -eq "h264") {
+            Write-Host "✅ Klaar: $InputFileDisplay converted directly to TV-safe H.264" -ForegroundColor Green
+            return $true
+        }
+
+        Write-Host "❌ Direct H.264 mode failed (final codec='$directCodec')" -ForegroundColor Red
+        return $false
     }
 
     # Use a temporary file
@@ -1906,7 +2087,7 @@ function Convert-HighBitDepthToH265 {
     $audioCodec = if ($Audio -eq "copy") { "copy" } else { "aac" }
     $audioParams = if ($Audio -eq "aac") { "-b:a 192k" } else { "" }
 
-    $resolutionText = if ($Resolution -eq "keep") { "${currentWidth}x${currentHeight}" } else { $Resolution }
+    $resolutionText = if ($scaleFilter) { "${targetWidth}x${targetHeight}" } elseif ($Resolution -eq "keep") { "${currentWidth}x${currentHeight}" } else { $Resolution }
     Write-Host "🎬 Converting $bitDepth to H.265 8-bit $resolutionText..." -ForegroundColor Cyan
     Write-Host "   Source: $InputFileDisplay | Encoder: $Encoder" -ForegroundColor Gray
 
@@ -2073,8 +2254,64 @@ function Convert-HighBitDepthToH265 {
             try {
                 Remove-Item -LiteralPath $InputFile -Force -ErrorAction Stop
                 Move-Item -Path $tempOutput -Destination $InputFile -Force -ErrorAction Stop
-                
-                Write-Host "✅ Klaar: $InputFileDisplay replaced with H.265 8-bit $Resolution [${elapsedTime}s]" -ForegroundColor Green
+
+                # Optional fallback: if source needed width capping for TV safety, create H.264 final output
+                if ($fallbackToH264Enabled -and $autoWidthCapped) {
+                    if ($fallbackH264Mode -eq "replace") {
+                        Show-Format "TV SAFE" "$InputFileDisplay" "HEVC output marked as risky; replacing with H.264 fallback" -NameColor "Yellow"
+                        Convert-H265ToH264WithAAC -InputFile $InputFile -Preset $fallbackH264Preset -CRF $fallbackH264CRF -Encoder $fallbackH264Encoder -AspectRatio $AspectRatio -LogFile ""
+
+                        $finalCodec = ""
+                        try {
+                            $finalCodec = (& $Global:FFprobeExe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 $InputFile 2>$null).Trim()
+                        } catch {
+                            $finalCodec = ""
+                        }
+
+                        if ($finalCodec -eq "h264") {
+                            Write-Host "✅ Klaar: $InputFileDisplay replaced with TV-safe H.264 fallback [${elapsedTime}s + fallback]" -ForegroundColor Green
+                            Remove-Item $progressFile -ErrorAction SilentlyContinue
+                            return $true
+                        }
+
+                        Write-Host "⚠️  H.264 fallback enabled but final codec is '$finalCodec' (keeping current output)" -ForegroundColor Yellow
+                    } elseif ($fallbackH264Mode -eq "separate") {
+                        Show-Format "TV SAFE" "$InputFileDisplay" "HEVC output kept; creating separate H.264 fallback file" -NameColor "Yellow"
+
+                        $inputDir = [System.IO.Path]::GetDirectoryName($InputFile)
+                        $inputBase = [System.IO.Path]::GetFileNameWithoutExtension($InputFile)
+                        $fallbackOutputPath = Join-Path $inputDir "$inputBase.tvsafe.h264.mkv"
+                        $fallbackTempInput = Join-Path $env:TEMP ([System.IO.Path]::GetRandomFileName() + ".mkv")
+
+                        try {
+                            Copy-Item -LiteralPath $InputFile -Destination $fallbackTempInput -Force -ErrorAction Stop
+                            Convert-H265ToH264WithAAC -InputFile $fallbackTempInput -Preset $fallbackH264Preset -CRF $fallbackH264CRF -Encoder $fallbackH264Encoder -AspectRatio $AspectRatio -LogFile ""
+
+                            $fallbackCodec = ""
+                            try {
+                                $fallbackCodec = (& $Global:FFprobeExe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 $fallbackTempInput 2>$null).Trim()
+                            } catch {
+                                $fallbackCodec = ""
+                            }
+
+                            if ($fallbackCodec -eq "h264") {
+                                Move-Item -LiteralPath $fallbackTempInput -Destination $fallbackOutputPath -Force -ErrorAction Stop
+                                Write-Host "✅ Klaar: HEVC kept + H.264 fallback created: $([System.IO.Path]::GetFileName($fallbackOutputPath))" -ForegroundColor Green
+                                Remove-Item $progressFile -ErrorAction SilentlyContinue
+                                return $true
+                            }
+
+                            Write-Host "⚠️  Separate H.264 fallback failed (codec='$fallbackCodec'). HEVC output kept." -ForegroundColor Yellow
+                        } catch {
+                            Write-Host "⚠️  Separate H.264 fallback failed: $_. HEVC output kept." -ForegroundColor Yellow
+                        } finally {
+                            Remove-Item -LiteralPath $fallbackTempInput -ErrorAction SilentlyContinue
+                        }
+                    }
+                } else {
+                    Write-Host "✅ Klaar: $InputFileDisplay replaced with H.265 8-bit $Resolution [${elapsedTime}s]" -ForegroundColor Green
+                }
+
                 Remove-Item $progressFile -ErrorAction SilentlyContinue
                 return $true
             } catch {

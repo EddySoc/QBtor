@@ -44,13 +44,14 @@ function Sync-AndScore {
             continue
         }
 
-        # Subtitle match prefix policy:
-        #   1) Contains SxxEyy => series match (episode-specific)
-        #   2) No SxxEyy, but has year => movie match
-        #   3) Fallback => full basename
-        $titlePrefix = if ($videoName -match '(?i)^(.+?[\.\s_-]S\d{2}E\d{2})(?:[\.\s_-]|$)') {
+        # Extract title prefix for fuzzy matching so manually downloaded subs are found
+        # even when codec/releasegroup differs. Priority:
+        #   1. Title + year:    "28.Years.Later.2025"
+        #   2. Title + episode: "Game.of.Thrones.S01E01"
+        #   3. Fallback:        full basename (original behaviour)
+        $titlePrefix = if ($videoName -match '^(.+?\.\d{4})\.') {
             $matches[1]
-        } elseif ($videoName -match '^(.+?[\.\s_-]\d{4})(?:[\.\s_-]|$)') {
+        } elseif ($videoName -match '^(.+?\.S\d{2}E\d{2})[\.\s]') {
             $matches[1]
         } else {
             $videoName
