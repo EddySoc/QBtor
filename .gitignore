@@ -37,6 +37,8 @@ venv/
 *.mov
 *.wmv
 *.webm
+*.incomplete
+*.incomplete.*
 *.srt
 *.ass
 *.sub
