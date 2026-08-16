@@ -1268,7 +1268,7 @@ function Split-SubtitleTextLines {
     )
 
     $textToClean = if ([string]::IsNullOrEmpty($Text)) { '' } else { $Text }
-    $cleanText = [regex]::Replace($textToClean, '\s+', ' ').Trim()
+    $cleanText = Normalize-SubtitleDialogueText -Text $textToClean
     if ([string]::IsNullOrWhiteSpace($cleanText)) {
         return @('')
     }
@@ -1322,22 +1322,252 @@ function Split-SubtitleTextLines {
         $lines.Add($currentLine)
     }
 
-    if ($MaxLines -le 0 -or $lines.Count -le $MaxLines) {
-        return @($lines)
+    # Prefer natural pause breaks for 2-line cues: if the second line is very short
+    # and the first line contains a comma, rebalance around the comma.
+    if ($MaxLines -eq 2 -and $lines.Count -eq 2) {
+        $line1 = $lines[0]
+        $line2 = $lines[1]
+
+        if ($line1 -match ',' -and $line2.Length -lt [int]($MaxCharsPerLine * 0.6)) {
+            $commaCandidates = [regex]::Matches($line1, ',')
+            if ($commaCandidates.Count -gt 0) {
+                $commaIdx = $commaCandidates[$commaCandidates.Count - 1].Index
+                $left = $line1.Substring(0, $commaIdx + 1).Trim()
+                $right = $line1.Substring($commaIdx + 1).Trim()
+
+                if (-not [string]::IsNullOrWhiteSpace($right)) {
+                    $newSecond = ("$right $line2").Trim()
+
+                    if (
+                        $left.Length -le $MaxCharsPerLine -and
+                        $newSecond.Length -le $MaxCharsPerLine -and
+                        $left.Length -ge [int]($MaxCharsPerLine * 0.35)
+                    ) {
+                        $lines[0] = $left
+                        $lines[1] = $newSecond
+                    }
+                }
+            }
+        }
     }
 
-    $result = [System.Collections.Generic.List[string]]::new()
-    for ($i = 0; $i -lt ($MaxLines - 1); $i++) {
-        $result.Add($lines[$i])
+    # If strict greedy wrapping produced >2 lines, try a balanced 2-line reflow.
+    # This helps avoid tiny orphan tails like "Mannen" in a separate micro-cue.
+    if ($MaxLines -eq 2 -and $lines.Count -gt 2) {
+        $fullText = (($lines | ForEach-Object { $_.Trim() }) -join ' ').Trim()
+        if (-not [string]::IsNullOrWhiteSpace($fullText)) {
+            $wordsForBalance = @($fullText -split '\s+' | Where-Object { $_ })
+            if ($wordsForBalance.Count -ge 2) {
+                $softLimit = $MaxCharsPerLine + 6
+                $bestLeft = $null
+                $bestRight = $null
+                $bestScore = [double]::PositiveInfinity
+
+                for ($splitIdx = 1; $splitIdx -lt $wordsForBalance.Count; $splitIdx++) {
+                    $left = ($wordsForBalance[0..($splitIdx - 1)] -join ' ').Trim()
+                    $right = ($wordsForBalance[$splitIdx..($wordsForBalance.Count - 1)] -join ' ').Trim()
+
+                    if ([string]::IsNullOrWhiteSpace($left) -or [string]::IsNullOrWhiteSpace($right)) { continue }
+                    if ($left.Length -gt $softLimit -or $right.Length -gt $softLimit) { continue }
+
+                    $lenDelta = [Math]::Abs($left.Length - $right.Length)
+                    $punctBonus = if ($left -match '[,;:!\?\.]$') { -4 } else { 0 }
+                    $overflowPenalty = [Math]::Max(0, $left.Length - $MaxCharsPerLine) + [Math]::Max(0, $right.Length - $MaxCharsPerLine)
+                    $score = ($lenDelta + $overflowPenalty * 2 + $punctBonus)
+
+                    if ($score -lt $bestScore) {
+                        $bestScore = $score
+                        $bestLeft = $left
+                        $bestRight = $right
+                    }
+                }
+
+                if ($bestLeft -and $bestRight) {
+                    $lines = [System.Collections.Generic.List[string]]::new()
+                    $lines.Add($bestLeft)
+                    $lines.Add($bestRight)
+                }
+            }
+        }
     }
 
-    # Keep the final allowed line readable and capped to the configured width.
-    $overflow = (($lines | Select-Object -Skip ($MaxLines - 1)) -join ' ').Trim()
-    if ($overflow.Length -gt $MaxCharsPerLine) {
-        $overflow = $overflow.Substring(0, $MaxCharsPerLine - 3).TrimEnd() + '...'
+    # Never truncate subtitle text here. If there are too many lines for a cue,
+    # Limit-SrtCueLines will split the cue into multiple timed cues.
+    $linesNoTrailingComma = @()
+    for ($idx = 0; $idx -lt $lines.Count; $idx++) {
+        $line = $lines[$idx].TrimEnd()
+
+        # Remove leading punctuation artifacts like ", dan ...".
+        $line = [regex]::Replace($line, '^\s*[,;:]+\s*', '')
+        if ($idx -eq ($lines.Count - 1)) {
+            # Only strip trailing comma on the LAST line of a cue.
+            # Keep commas on intermediate lines when they represent a natural pause.
+            $line = [regex]::Replace($line, ',\s*$', '')
+        }
+        $linesNoTrailingComma += $line
     }
-    $result.Add($overflow)
-    return @($result)
+    return @($linesNoTrailingComma)
+}
+
+function Normalize-SubtitleDialogueText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ''
+    }
+
+    $clean = [regex]::Replace($Text, '\s+', ' ').Trim()
+
+    # Common STT punctuation artifacts.
+    $clean = [regex]::Replace($clean, '\s*,\s*,+\s*', ', ')
+    $clean = [regex]::Replace($clean, ',\s*([\.!\?;:])', '$1')
+    $clean = [regex]::Replace($clean, '\s+([,\.;:!\?])', '$1')
+    $clean = [regex]::Replace($clean, '([,]){2,}', ',')
+    $clean = [regex]::Replace($clean, '([;:!\?]){2,}', '$1')
+    $clean = [regex]::Replace($clean, '\.{4,}', '...')
+
+    # Drop short truncated tail fragments like "aank..." or "groo...".
+    $clean = [regex]::Replace($clean, '\s+[A-Za-zÀ-ÿ]{2,6}\.\.\.\s*$', '')
+
+    # Remove leading punctuation artifacts when a fragment starts with commas.
+    $clean = [regex]::Replace($clean, '^\s*[,;:]+\s*', '')
+
+    # If a cue still ends with ellipsis, remove it to avoid visible clipping artifacts.
+    $clean = [regex]::Replace($clean, '\s*\.\.\.\s*$', '')
+
+    # Subtitles generally should not end with a dangling comma.
+    $clean = [regex]::Replace($clean, ',\s*$', '')
+
+    # Guard against empty text after cleanup.
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        return '...'
+    }
+
+    $clean = [regex]::Replace($clean, '\s{2,}', ' ')
+
+    return $clean.Trim()
+}
+
+function Convert-SrtTimestampToMilliseconds {
+    param([string]$Timestamp)
+
+    if ([string]::IsNullOrWhiteSpace($Timestamp)) {
+        return $null
+    }
+
+    $ts = $Timestamp.Trim() -replace '\.', ','
+    if ($ts -notmatch '^(\d{2}):(\d{2}):(\d{2}),(\d{3})$') {
+        return $null
+    }
+
+    $hours = [int]$matches[1]
+    $mins = [int]$matches[2]
+    $secs = [int]$matches[3]
+    $millis = [int]$matches[4]
+
+    return [int64]((((($hours * 60) + $mins) * 60) + $secs) * 1000 + $millis)
+}
+
+function Convert-MillisecondsToSrtTimestamp {
+    param([Int64]$Milliseconds)
+
+    if ($Milliseconds -lt 0) { $Milliseconds = 0 }
+
+    $hours = [int][Math]::Floor($Milliseconds / 3600000)
+    $remainder = $Milliseconds % 3600000
+    $mins = [int][Math]::Floor($remainder / 60000)
+    $remainder = $remainder % 60000
+    $secs = [int][Math]::Floor($remainder / 1000)
+    $millis = [int]($remainder % 1000)
+
+    return ('{0:00}:{1:00}:{2:00},{3:000}' -f $hours, $mins, $secs, $millis)
+}
+
+function Split-SubtitleCueByPauses {
+    param(
+        [string]$Text,
+        [int]$MaxCharsPerLine = 42,
+        [int]$MaxLines = 2
+    )
+
+    $clean = Normalize-SubtitleDialogueText -Text $Text
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        return @()
+    }
+
+    if ($MaxCharsPerLine -lt 8) { $MaxCharsPerLine = 42 }
+    if ($MaxLines -lt 1) { $MaxLines = 2 }
+    $targetCueChars = $MaxCharsPerLine * $MaxLines
+
+    $strongParts = @($clean -split '(?<=[\.!\?;:])\s+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($strongParts.Count -eq 0) {
+        $strongParts = @($clean)
+    }
+
+    $chunks = [System.Collections.Generic.List[string]]::new()
+    foreach ($part in $strongParts) {
+        if ($part.Length -le $targetCueChars) {
+            $chunks.Add($part)
+            continue
+        }
+
+        # Split long parts on commas to better follow natural speaking pauses.
+        $commaParts = @($part -split '(?<=,)\s+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($commaParts.Count -le 1) {
+            $commaParts = @($part)
+        }
+
+        $current = ''
+        foreach ($cp in $commaParts) {
+            if ([string]::IsNullOrWhiteSpace($current)) {
+                $current = $cp
+                continue
+            }
+
+            $candidate = "$current $cp"
+            if ($candidate.Length -le $targetCueChars) {
+                $current = $candidate
+            } else {
+                $chunks.Add($current)
+                $current = $cp
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($current)) {
+            $chunks.Add($current)
+        }
+    }
+
+    # Final guard: hard split anything still too long without dropping text.
+    $finalChunks = [System.Collections.Generic.List[string]]::new()
+    foreach ($chunk in $chunks) {
+        if ($chunk.Length -le $targetCueChars) {
+            $finalChunks.Add($chunk)
+            continue
+        }
+
+        $words = @($chunk -split '\s+' | Where-Object { $_ })
+        $current = ''
+        foreach ($word in $words) {
+            if ([string]::IsNullOrWhiteSpace($current)) {
+                $current = $word
+                continue
+            }
+
+            $candidate = "$current $word"
+            if ($candidate.Length -le $targetCueChars) {
+                $current = $candidate
+            } else {
+                $finalChunks.Add($current)
+                $current = $word
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($current)) {
+            $finalChunks.Add($current)
+        }
+    }
+
+    return @($finalChunks)
 }
 
 function Limit-SrtCueLines {
@@ -1393,17 +1623,216 @@ function Limit-SrtCueLines {
         }
 
         $textLines = @($blockLines | Select-Object -Skip 2)
-        $text = ([regex]::Replace(($textLines -join ' '), '\s+', ' ')).Trim()
+        $text = Normalize-SubtitleDialogueText -Text (($textLines -join ' '))
         if ([string]::IsNullOrWhiteSpace($text)) { $text = '...' }
 
-        $wrappedLines = Split-SubtitleTextLines -Text $text -MaxCharsPerLine $MaxCharsPerLine -MaxLines $MaxLines
-        $rebuiltBlock = @("$nextIndex", $timestampLine) + $wrappedLines
-        $rebuiltBlocks.Add(($rebuiltBlock -join "`r`n"))
+        $pauseChunks = Split-SubtitleCueByPauses -Text $text -MaxCharsPerLine $MaxCharsPerLine -MaxLines $MaxLines
+        if ($pauseChunks.Count -eq 0) {
+            $pauseChunks = @('...')
+        }
+
+        $timeMatch = [regex]::Match($timestampLine, '^(?<start>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?<end>\d{2}:\d{2}:\d{2},\d{3})$')
+        if (-not $timeMatch.Success) {
+            continue
+        }
+
+        $startMs = Convert-SrtTimestampToMilliseconds -Timestamp $timeMatch.Groups['start'].Value
+        $endMs = Convert-SrtTimestampToMilliseconds -Timestamp $timeMatch.Groups['end'].Value
+        if ($null -eq $startMs -or $null -eq $endMs -or $endMs -le $startMs) {
+            continue
+        }
+
+        $lineChunks = [System.Collections.Generic.List[object[]]]::new()
+        $originalWrappedLineCount = 0
+        foreach ($pauseChunk in $pauseChunks) {
+            $wrappedLines = Split-SubtitleTextLines -Text $pauseChunk -MaxCharsPerLine $MaxCharsPerLine -MaxLines $MaxLines
+            if ($wrappedLines.Count -eq 0) {
+                $wrappedLines = @('...')
+            }
+
+            $originalWrappedLineCount += $wrappedLines.Count
+            for ($lineIndex = 0; $lineIndex -lt $wrappedLines.Count; $lineIndex += $MaxLines) {
+                $chunk = @($wrappedLines | Select-Object -Skip $lineIndex -First $MaxLines)
+                if ($chunk.Count -gt 0) {
+                    $lineChunks.Add($chunk)
+                }
+            }
+        }
+
+        if ($lineChunks.Count -eq 0) {
+            $lineChunks.Add(@('...'))
+        }
+
+        # Merge a tiny trailing one-word chunk into the previous chunk if it fits.
+        if ($lineChunks.Count -ge 2) {
+            $lastChunk = @($lineChunks[$lineChunks.Count - 1])
+            $prevChunk = @($lineChunks[$lineChunks.Count - 2])
+
+            if ($lastChunk.Count -eq 1 -and $prevChunk.Count -ge 1) {
+                $tailText = $lastChunk[0].Trim()
+                $isTinyTail = ($tailText -match '^[A-Za-zÀ-ÿ]{1,12}$')
+                if ($isTinyTail) {
+                    $prevLastLine = $prevChunk[$prevChunk.Count - 1]
+                    $candidate = ("$prevLastLine $tailText").Trim()
+                    if ($candidate.Length -le $MaxCharsPerLine) {
+                        $prevChunk[$prevChunk.Count - 1] = $candidate
+                        $lineChunks[$lineChunks.Count - 2] = $prevChunk
+                        $lineChunks.RemoveAt($lineChunks.Count - 1)
+                        $changed = $true
+                    }
+                }
+            }
+        }
+
+        $durationMs = [int64]($endMs - $startMs)
+        $weights = [System.Collections.Generic.List[int]]::new()
+        $totalWeight = 0
+        foreach ($chunk in $lineChunks) {
+            $w = ([string]::Join(' ', $chunk)).Length
+            if ($w -lt 1) { $w = 1 }
+            $weights.Add($w)
+            $totalWeight += $w
+        }
+        if ($totalWeight -lt 1) { $totalWeight = $lineChunks.Count }
+
+        $minChunkMs = 120
+        $cursorStart = [int64]$startMs
+
+        for ($chunkIndex = 0; $chunkIndex -lt $lineChunks.Count; $chunkIndex++) {
+            $remainingAfter = $lineChunks.Count - $chunkIndex - 1
+
+            if ($chunkIndex -eq ($lineChunks.Count - 1)) {
+                $chunkEnd = [int64]$endMs
+            } else {
+                $rawShare = [int64][Math]::Round(($durationMs * $weights[$chunkIndex]) / $totalWeight)
+                if ($rawShare -lt $minChunkMs) { $rawShare = $minChunkMs }
+
+                $latestAllowed = [int64]($endMs - ($remainingAfter * $minChunkMs))
+                $chunkEnd = $cursorStart + $rawShare
+                if ($chunkEnd -gt $latestAllowed) { $chunkEnd = $latestAllowed }
+                if ($chunkEnd -le $cursorStart) { $chunkEnd = $cursorStart + 1 }
+            }
+
+            $chunkTimestamp = "$(Convert-MillisecondsToSrtTimestamp -Milliseconds $cursorStart) --> $(Convert-MillisecondsToSrtTimestamp -Milliseconds $chunkEnd)"
+            $rebuiltBlock = @("$nextIndex", $chunkTimestamp) + @($lineChunks[$chunkIndex])
+            $rebuiltBlocks.Add(($rebuiltBlock -join "`r`n"))
+
+            $nextIndex++
+            $cursorStart = $chunkEnd
+        }
 
         if ($indexLine -ne "$nextIndex") { $changed = $true }
-        if ($textLines.Count -ne $wrappedLines.Count) { $changed = $true }
+        if ($textLines.Count -ne $originalWrappedLineCount -or $lineChunks.Count -gt 1) { $changed = $true }
+    }
 
-        $nextIndex++
+    # Adjacent cue carryover:
+    # If a cue ends with a connector word and the next cue starts immediately,
+    # pull 1..3 words from the next cue when it improves flow and still fits.
+    if ($rebuiltBlocks.Count -ge 2) {
+        for ($bi = 0; $bi -lt ($rebuiltBlocks.Count - 1); $bi++) {
+            $curLines = @($rebuiltBlocks[$bi] -split "`r?`n" | ForEach-Object { $_.TrimEnd() })
+            $nextLines = @($rebuiltBlocks[$bi + 1] -split "`r?`n" | ForEach-Object { $_.TrimEnd() })
+
+            if ($curLines.Count -lt 3 -or $nextLines.Count -lt 3) { continue }
+
+            $curTs = [regex]::Match($curLines[1], '^(?<s>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?<e>\d{2}:\d{2}:\d{2},\d{3})$')
+            $nextTs = [regex]::Match($nextLines[1], '^(?<s>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?<e>\d{2}:\d{2}:\d{2},\d{3})$')
+            if (-not $curTs.Success -or -not $nextTs.Success) { continue }
+
+            $curEndMs = Convert-SrtTimestampToMilliseconds -Timestamp $curTs.Groups['e'].Value
+            $nextStartMs = Convert-SrtTimestampToMilliseconds -Timestamp $nextTs.Groups['s'].Value
+            if ($null -eq $curEndMs -or $null -eq $nextStartMs) { continue }
+
+            # Only if cues are directly adjacent or nearly adjacent.
+            if ([Math]::Abs([int64]($nextStartMs - $curEndMs)) -gt 400) { continue }
+
+            $curTextLines = @($curLines | Select-Object -Skip 2)
+            $nextTextLines = @($nextLines | Select-Object -Skip 2)
+            if ($curTextLines.Count -eq 0 -or $nextTextLines.Count -eq 0) { continue }
+
+            $lastCur = $curTextLines[$curTextLines.Count - 1].Trim()
+            if ($lastCur -notmatch '(?i)\b(en|of|maar|want|omdat|zodat|terwijl|als|dan)$') { continue }
+
+            # Safety: do not carry over if previous line already clearly ended a sentence.
+            if ($lastCur -match '[\.!\?]$') { continue }
+
+            $nextAllText = (($nextTextLines -join ' ').Trim())
+            if ([string]::IsNullOrWhiteSpace($nextAllText)) { continue }
+
+            # Safety: if next cue starts like a new sentence (uppercase, possibly after quote/paren),
+            # we should not borrow words from it.
+            if ($nextAllText -match '^\s*["''\(\[]?[A-ZÀ-Ý]') { continue }
+
+            $firstWordMatch = [regex]::Match($nextAllText, '^\s*(?<w>[A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9''-]*)\b')
+            if (-not $firstWordMatch.Success) { continue }
+            $firstWord = $firstWordMatch.Groups['w'].Value
+            if ([string]::IsNullOrWhiteSpace($firstWord)) { continue }
+
+            # Safety: only carry from a likely continuation (starts lowercase).
+            if ([char]::IsUpper($firstWord[0])) { continue }
+
+            $nextWords = @([regex]::Matches($nextAllText, "[A-Za-zÀ-ÿ0-9'-]+") | ForEach-Object { $_.Value })
+            if ($nextWords.Count -lt 2) { continue }
+
+            $carryApplied = $false
+            $maxCarryWords = [Math]::Min(3, $nextWords.Count - 1)
+
+            for ($cw = $maxCarryWords; $cw -ge 1; $cw--) {
+                $carryPhrase = ($nextWords[0..($cw - 1)] -join ' ').Trim()
+                if ([string]::IsNullOrWhiteSpace($carryPhrase)) { continue }
+
+                $candidateLastLine = ("$lastCur $carryPhrase").Trim()
+                if ($candidateLastLine.Length -gt $MaxCharsPerLine) { continue }
+
+                $curPrefixLines = @()
+                if ($curTextLines.Count -gt 1) {
+                    $curPrefixLines = @($curTextLines | Select-Object -First ($curTextLines.Count - 1))
+                }
+
+                $curCombinedText = ((@($curPrefixLines) + @($candidateLastLine)) -join ' ').Trim()
+
+                # Remove only the carried leading words from nextAllText and keep
+                # punctuation/casing of the remainder exactly as recognized.
+                $removePattern = '^(\s*(?:[A-Za-zÀ-ÿ0-9''-]+\s+){' + ($cw - 1) + '}[A-Za-zÀ-ÿ0-9''-]+)\s*'
+                $nextRemainingText = [regex]::Replace($nextAllText, $removePattern, '', 1).Trim()
+                if ([string]::IsNullOrWhiteSpace($nextRemainingText)) { continue }
+
+                $curReflow = Split-SubtitleTextLines -Text $curCombinedText -MaxCharsPerLine $MaxCharsPerLine -MaxLines $MaxLines
+                $nextReflow = Split-SubtitleTextLines -Text $nextRemainingText -MaxCharsPerLine $MaxCharsPerLine -MaxLines $MaxLines
+
+                if ($curReflow.Count -eq 0 -or $nextReflow.Count -eq 0) { continue }
+                if ($curReflow.Count -gt $MaxLines -or $nextReflow.Count -gt $MaxLines) { continue }
+
+                $rebuiltBlocks[$bi] = (@($curLines[0], $curLines[1]) + @($curReflow)) -join "`r`n"
+                $rebuiltBlocks[$bi + 1] = (@($nextLines[0], $nextLines[1]) + @($nextReflow)) -join "`r`n"
+                $changed = $true
+                $carryApplied = $true
+                break
+            }
+
+            if ($carryApplied) { continue }
+        }
+
+        # If carryover was not possible, remove dangling connector endings
+        # like "... en" / "... of" before the next cue.
+        for ($bi = 0; $bi -lt ($rebuiltBlocks.Count - 1); $bi++) {
+            $curLines = @($rebuiltBlocks[$bi] -split "`r?`n" | ForEach-Object { $_.TrimEnd() })
+            if ($curLines.Count -lt 3) { continue }
+
+            $curTextLines = @($curLines | Select-Object -Skip 2)
+            if ($curTextLines.Count -eq 0) { continue }
+
+            $lastIdx = $curTextLines.Count - 1
+            $lastText = $curTextLines[$lastIdx].Trim()
+            if ($lastText -notmatch '(?i)\b(en|of|maar|want|omdat|zodat|terwijl|als|dan)$') { continue }
+
+            $trimmed = [regex]::Replace($lastText, '(?i)\s+\b(en|of|maar|want|omdat|zodat|terwijl|als|dan)\s*$', '').Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+
+            $curTextLines[$lastIdx] = $trimmed
+            $rebuiltBlocks[$bi] = (@($curLines[0], $curLines[1]) + $curTextLines) -join "`r`n"
+            $changed = $true
+        }
     }
 
     if ($rebuiltBlocks.Count -eq 0) {

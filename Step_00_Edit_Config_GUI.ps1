@@ -967,7 +967,87 @@ $controls['STT_STTEnabled'] = Add-ConfigCheckbox $panelSTT $y "STT inschakelen (
 $y += 35
 $controls['STT_STTModel'] = Add-ConfigCombo $panelSTT $y "Whisper model:" $config['STT']['STTModel'] @('tiny','base','small','medium','large') "tiny/base = snel maar minder nauwkeurig | medium/large = beter maar trager"
 $y += 35
-$controls['STT_STTLanguage'] = Add-ConfigField $panelSTT $y "Audiotaal:" $config['STT']['STTLanguage'] "Taalcode van de audio: auto (automatisch detecteren) of bijv. eng, nl, fr" 150
+$sttLanguageRaw = "$(if ($config['STT']['STTLanguage']) { $config['STT']['STTLanguage'] } else { 'auto' })".ToLower().Trim()
+if ($sttLanguageRaw -in @('dut','nl','ned')) { $sttLanguageRaw = 'nld' }
+if ($sttLanguageRaw -notin @('auto','eng','fra','spa','nld')) { $sttLanguageRaw = 'auto' }
+$controls['STT_STTLanguage'] = Add-ConfigCombo $panelSTT $y "Audiotaal:" $sttLanguageRaw @('auto','eng','fra','spa','nld') "Kies audiotaal voor Whisper. auto = detectie, eng/fra/spa/nld = geforceerde taal (stabieler)."
+$y += 40
+
+$labelSTTPreset = New-Object System.Windows.Forms.Label
+$labelSTTPreset.Location = New-Object System.Drawing.Point(10, $y)
+$labelSTTPreset.Size = New-Object System.Drawing.Size(200, 20)
+$labelSTTPreset.Text = "STT preset:"
+$panelSTT.Controls.Add($labelSTTPreset)
+
+$comboSTTPreset = New-Object System.Windows.Forms.ComboBox
+$comboSTTPreset.Location = New-Object System.Drawing.Point(220, $y)
+$comboSTTPreset.Size = New-Object System.Drawing.Size(220, 20)
+$comboSTTPreset.DropDownStyle = 'DropDownList'
+@('Aangepast','Kwaliteit Eerst','Balans','Snelheid Eerst') | ForEach-Object { $comboSTTPreset.Items.Add($_) | Out-Null }
+$comboSTTPreset.SelectedItem = 'Aangepast'
+$globalToolTip.SetToolTip($comboSTTPreset, "Kies een preset om STT-instellingen automatisch in te vullen.")
+$comboSTTPreset.Add_SelectedIndexChanged({
+    if ($comboSTTPreset.SelectedItem -eq 'Kwaliteit Eerst') {
+        if ($controls['STT_STTModel'] -and ($controls['STT_STTModel'].Items -contains 'large')) {
+            $controls['STT_STTModel'].SelectedItem = 'large'
+        }
+        if ($controls['STT_STTLanguage']) {
+            $controls['STT_STTLanguage'].SelectedItem = 'auto'
+        }
+        if ($controls['STT_STTMultilingual'] -and ($controls['STT_STTMultilingual'].Items -contains 'auto')) {
+            $controls['STT_STTMultilingual'].SelectedItem = 'auto'
+        }
+        if ($controls['STT_STTDetectionSegments']) {
+            $controls['STT_STTDetectionSegments'].Text = '10'
+        }
+        if ($controls['STT_STTOutputLang']) {
+            $controls['STT_STTOutputLang'].Text = 'eng'
+        }
+        Mark-Changed
+    } elseif ($comboSTTPreset.SelectedItem -eq 'Balans') {
+        if ($controls['STT_STTModel'] -and ($controls['STT_STTModel'].Items -contains 'medium')) {
+            $controls['STT_STTModel'].SelectedItem = 'medium'
+        }
+        if ($controls['STT_STTLanguage']) {
+            $controls['STT_STTLanguage'].SelectedItem = 'auto'
+        }
+        if ($controls['STT_STTMultilingual'] -and ($controls['STT_STTMultilingual'].Items -contains 'auto')) {
+            $controls['STT_STTMultilingual'].SelectedItem = 'auto'
+        }
+        if ($controls['STT_STTDetectionSegments']) {
+            $controls['STT_STTDetectionSegments'].Text = '5'
+        }
+        if ($controls['STT_STTOutputLang']) {
+            $controls['STT_STTOutputLang'].Text = 'eng'
+        }
+        Mark-Changed
+    } elseif ($comboSTTPreset.SelectedItem -eq 'Snelheid Eerst') {
+        if ($controls['STT_STTModel'] -and ($controls['STT_STTModel'].Items -contains 'medium')) {
+            $controls['STT_STTModel'].SelectedItem = 'medium'
+        }
+        if ($controls['STT_STTLanguage']) {
+            $controls['STT_STTLanguage'].SelectedItem = 'eng'
+        }
+        if ($controls['STT_STTMultilingual'] -and ($controls['STT_STTMultilingual'].Items -contains 'false')) {
+            $controls['STT_STTMultilingual'].SelectedItem = 'false'
+        }
+        if ($controls['STT_STTDetectionSegments']) {
+            $controls['STT_STTDetectionSegments'].Text = '3'
+        }
+        if ($controls['STT_STTOutputLang']) {
+            $controls['STT_STTOutputLang'].Text = 'eng'
+        }
+        Mark-Changed
+    }
+})
+$panelSTT.Controls.Add($comboSTTPreset)
+
+$labelSTTPresetHint = New-Object System.Windows.Forms.Label
+$labelSTTPresetHint.Location = New-Object System.Drawing.Point(450, $y + 2)
+$labelSTTPresetHint.Size = New-Object System.Drawing.Size(250, 22)
+$labelSTTPresetHint.Text = "Kwaliteit = beter, Snelheid = sneller"
+$labelSTTPresetHint.ForeColor = [System.Drawing.Color]::DarkGreen
+$panelSTT.Controls.Add($labelSTTPresetHint)
 $y += 35
 $controls['STT_STTMultilingual'] = Add-ConfigCombo $panelSTT $y "Meertalig (multilingual):" $config['STT']['STTMultilingual'] @('auto','true','false') "auto = aan bij STTLanguage=auto, uit bij vaste taal  |  true = altijd per segment detecteren (traagst)  |  false = nooit, één detectie aan het begin (snelst)"
 $y += 35

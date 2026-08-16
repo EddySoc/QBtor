@@ -360,6 +360,7 @@ public class WhisperOutputReader {
             # Polling loop op de hoofd-thread — Write-Progress mag hier wel
             $allLines = [System.Collections.Generic.List[string]]::new()
             $lastPct  = -1
+            $sttNoisePattern = '(?i)(^\s*model\.bin:|^\s*tokenizer\.json:|^\s*vocabulary(\.json|\.txt)?:|^\s*config\.json:|^\s*preprocessor_config\.json:|\|\s*\d+%\||^\s*\[[-#]+\]\s*\d+%)'
 
             while (-not $proc.HasExited) {
                 foreach ($readerObj in @($stdoutReader, $stderrReader)) {
@@ -379,7 +380,7 @@ public class WhisperOutputReader {
                                            -Status "$videoName  ($pct%)" `
                                            -PercentComplete $pct
                             Write-Host "`r  [STT] [$bar$empty] $pct%  " -NoNewline -ForegroundColor Cyan
-                        } elseif ($line.Trim() -ne '') {
+                        } elseif ($line.Trim() -ne '' -and $line -notmatch $sttNoisePattern) {
                             # Toon alle andere niet-lege regels (model laden, taaldetectie, etc.)
                             Write-Host "  [STT] $($line.Trim())" -ForegroundColor DarkCyan
                         }
